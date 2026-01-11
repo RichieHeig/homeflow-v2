@@ -5,23 +5,50 @@ import { useAuthStore } from './store/authStore'
 import Login from './pages/Login'
 import SignUp from './pages/SignUp'
 import Dashboard from './pages/Dashboard'
+import Onboarding from './pages/Onboarding'
 
 function App() {
   const { user, setUser } = useAuthStore()
   const [loading, setLoading] = useState(true)
+  const [hasMember, setHasMember] = useState<boolean | null>(null)
 
   useEffect(() => {
     // Vérifier la session au chargement
-    supabase.auth.getSession().then(({ data: { session } }) => {
+    supabase.auth.getSession().then(async ({ data: { session } }) => {
       setUser(session?.user ?? null)
+      
+      // Si l'utilisateur est connecté, vérifier s'il est dans la table members
+      if (session?.user) {
+        const { data: memberData } = await supabase
+          .from('members')
+          .select('id')
+          .eq('id', session.user.id)
+          .single()
+        
+        setHasMember(!!memberData)
+      }
+      
       setLoading(false)
     })
 
     // Écouter les changements d'authentification
     const {
       data: { subscription },
-    } = supabase.auth.onAuthStateChange((_event, session) => {
+    } = supabase.auth.onAuthStateChange(async (_event, session) => {
       setUser(session?.user ?? null)
+      
+      // Vérifier le membre lors du changement d'auth
+      if (session?.user) {
+        const { data: memberData } = await supabase
+          .from('members')
+          .select('id')
+          .eq('id', session.user.id)
+          .single()
+        
+        setHasMember(!!memberData)
+      } else {
+        setHasMember(null)
+      }
     })
 
     return () => subscription.unsubscribe()
@@ -43,7 +70,11 @@ function App() {
       <Routes>
         <Route
           path="/"
-          element={user ? <Navigate to="/dashboard" replace /> : <Navigate to="/login" replace />}
+          element={
+            user 
+              ? (hasMember === false ? <Navigate to="/onboarding" replace /> : <Navigate to="/dashboard" replace />)
+              : <Navigate to="/login" replace />
+          }
         />
         <Route
           path="/login"
@@ -54,8 +85,20 @@ function App() {
           element={user ? <Navigate to="/dashboard" replace /> : <SignUp />}
         />
         <Route
+          path="/onboarding"
+          element={
+            user 
+              ? (hasMember === true ? <Navigate to="/dashboard" replace /> : <Onboarding />)
+              : <Navigate to="/login" replace />
+          }
+        />
+        <Route
           path="/dashboard"
-          element={user ? <Dashboard /> : <Navigate to="/login" replace />}
+          element={
+            user 
+              ? (hasMember === false ? <Navigate to="/onboarding" replace /> : <Dashboard />)
+              : <Navigate to="/login" replace />
+          }
         />
       </Routes>
     </BrowserRouter>
