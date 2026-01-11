@@ -47,9 +47,10 @@ export default function Onboarding() {
       if (householdError) throw householdError
 
       // Ajouter le créateur comme admin du foyer
-      const { error: memberError } = await supabase
+     const { error: memberError } = await supabase
         .from('members')
         .insert({
+          id: user.id,
           household_id: household.id,
           display_name: displayName,
           role: 'admin',
@@ -90,6 +91,7 @@ export default function Onboarding() {
       const { error: memberError } = await supabase
         .from('members')
         .insert({
+          id: user.id,
           household_id: household.id,
           display_name: joinDisplayName,
           role: 'member',
