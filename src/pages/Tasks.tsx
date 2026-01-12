@@ -200,6 +200,8 @@ export default function Tasks() {
   }
 
   const handleLogout = async () => {
+    // Nettoyer le localStorage avant déconnexion
+    localStorage.removeItem('homeflow_household_id')
     await supabase.auth.signOut()
     setUser(null)
     navigate('/login')
