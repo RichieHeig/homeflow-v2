@@ -220,20 +220,32 @@ export default function Tasks() {
 
   const handleCreateTask = async (e: React.FormEvent) => {
     e.preventDefault()
+    
+    console.log('🎯 handleCreateTask - CLICKED!')
+    console.log('👤 User:', user ? 'exists' : 'NULL')
+    console.log('🏠 State householdId:', householdId)
+    console.log('💾 localStorage householdId:', localStorage.getItem('homeflow_household_id'))
 
     if (!user) {
+      console.error('❌ NO USER')
       alert('Utilisateur non connecté')
       return
     }
 
     const hId = householdId || localStorage.getItem('homeflow_household_id')
     
+    console.log('🔑 Final householdId to use:', hId)
+    
     if (!hId) {
+      console.error('❌ NO HOUSEHOLD ID')
       alert('Foyer non trouvé. Veuillez rafraîchir la page.')
       return
     }
 
+    console.log('📝 Form data:', formData)
+
     try {
+      console.log('💾 Inserting task into Supabase...')
       const { error } = await supabase.from('tasks').insert({
         household_id: hId,
         title: formData.title,
@@ -247,9 +259,11 @@ export default function Tasks() {
       })
 
       if (error) {
-        console.error('Erreur lors de la création:', error)
+        console.error('❌ Supabase error:', error)
         throw error
       }
+
+      console.log('✅ Task created successfully!')
 
       // Réinitialiser le formulaire
       setFormData({
@@ -261,13 +275,15 @@ export default function Tasks() {
         points: 10,
       })
       
+      console.log('🔄 Closing modal and reloading tasks...')
       // Fermer le modal
       setShowModal(false)
       
       // Recharger les données
       await loadTasks()
+      console.log('✅ handleCreateTask - COMPLETE')
     } catch (err: any) {
-      console.error('Erreur:', err)
+      console.error('💥 Error in handleCreateTask:', err)
       alert('Erreur lors de la création de la tâche: ' + (err.message || 'Erreur inconnue'))
     }
   }
