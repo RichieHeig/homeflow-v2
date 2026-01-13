@@ -2,23 +2,22 @@ import { useEffect, useState, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { supabase } from '@/lib/supabase'
 import { useAuthStore } from '@/store/authStore'
-import { 
-  Home, 
-  LogOut, 
-  Plus, 
-  CheckCircle2, 
-  Circle, 
-  Trash2, 
+import {
+  Home,
+  LogOut,
+  Plus,
+  CheckCircle2,
+  Circle,
+  Trash2,
   Clock,
   User,
   Filter,
   X,
   Loader2,
   WifiOff,
-  RefreshCw // Nouvelle icône pour le reset
+  RefreshCw,
 } from 'lucide-react'
 
-// ... (Gardes tes interfaces Task, Member, Household et CATEGORIES ici, ça ne change pas) ...
 interface Task {
   id: string
   title: string
@@ -60,19 +59,19 @@ const CATEGORIES = [
 export default function Tasks() {
   const navigate = useNavigate()
   const { user, setUser } = useAuthStore()
-  
+
   const [tasks, setTasks] = useState<Task[]>([])
   const [members, setMembers] = useState<Member[]>([])
   const [household, setHousehold] = useState<Household | null>(null)
   const [householdId, setHouseholdId] = useState<string | null>(null)
-  
+
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [showModal, setShowModal] = useState(false)
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [filter, setFilter] = useState<'all' | 'pending' | 'completed'>('pending')
   const [selectedMemberFilter, setSelectedMemberFilter] = useState<string | null>(null)
-  
+
   const hasLoadedData = useRef(false)
 
   const [formData, setFormData] = useState({
@@ -84,14 +83,58 @@ export default function Tasks() {
     points: 10,
   })
 
+  // ✅ FIX PRO : Hydrate la session Supabase au mount (évite le spinner infini après refresh)
+  useEffect(() => {
+    let mounted = true
+
+    const initAuth = async () => {
+      try {
+        const { data, error } = await supabase.auth.getUser()
+
+        if (!mounted) return
+
+        if (error || !data?.user) {
+          setUser(null)
+          setLoading(false)
+          navigate('/login')
+          return
+        }
+
+        // hydrate le store
+        setUser(data.user)
+      } catch {
+        if (!mounted) return
+        setUser(null)
+        setLoading(false)
+        navigate('/login')
+      }
+    }
+
+    initAuth()
+
+    const { data: sub } = supabase.auth.onAuthStateChange((_event, session) => {
+      if (!mounted) return
+      setUser(session?.user ?? null)
+      if (!session?.user) {
+        setLoading(false)
+        navigate('/login')
+      }
+    })
+
+    return () => {
+      mounted = false
+      sub?.subscription?.unsubscribe()
+    }
+  }, [navigate, setUser])
+
   // Fonction pour faire un "Hard Reset" quand ça plante
   const handleHardRefresh = () => {
-    console.log("🧹 Nettoyage du cache et rechargement...")
-    localStorage.removeItem('homeflow_household_id') // On supprime l'ID qui pose problème
-    // On pourrait utiliser localStorage.clear() mais attention ça déconnecte tout
+    console.log('🧹 Nettoyage du cache et rechargement...')
+    localStorage.removeItem('homeflow_household_id')
     window.location.reload()
   }
 
+  // ✅ Quand user est prêt, on charge les données 1 seule fois
   useEffect(() => {
     if (!hasLoadedData.current && user) {
       hasLoadedData.current = true
@@ -99,16 +142,19 @@ export default function Tasks() {
     }
   }, [user])
 
+  // Rechargement quand filtres changent (uniquement après init)
   useEffect(() => {
     const safeHouseholdId = householdId || localStorage.getItem('homeflow_household_id')
     if (hasLoadedData.current && safeHouseholdId && !loading && !error) {
       loadTasksForHousehold(safeHouseholdId)
     }
-  }, [filter, selectedMemberFilter]) 
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filter, selectedMemberFilter])
 
   const loadInitialData = async () => {
     if (!user) {
       setLoading(false)
+      navigate('/login')
       return
     }
 
@@ -127,38 +173,34 @@ export default function Tasks() {
 
         setHousehold({ id: hId, name: householdData.name })
         setHouseholdId(hId)
-        
-        // On écrase le vieux cache avec la donnée fraîche
+
         localStorage.setItem('homeflow_household_id', hId)
 
-        const { data: membersData } = await supabase
+        const { data: membersData, error: membersError } = await supabase
           .from('members')
           .select('id, display_name')
           .eq('household_id', memberData.household_id)
-        
+
+        if (membersError) throw membersError
         setMembers(membersData || [])
 
         await loadTasksForHousehold(hId)
       }
 
-      // Timeout de 10 secondes
-      const timeoutPromise = new Promise((_, reject) => 
+      const timeoutPromise = new Promise((_, reject) =>
         setTimeout(() => reject(new Error('TIMEOUT_STARTUP')), 10000)
       )
 
       await Promise.race([fetchDataPromise(), timeoutPromise])
       setError(null)
-
     } catch (error: any) {
       console.error('Erreur chargement initial:', error)
-      
-      // AUTO-NETTOYAGE : Si ça plante au démarrage, on suppose que le cache est pourri
       localStorage.removeItem('homeflow_household_id')
 
-      if (error.message === 'TIMEOUT_STARTUP') {
-        setError("La connexion est lente. Nous avons nettoyé le cache, réessayez.")
+      if (error?.message === 'TIMEOUT_STARTUP') {
+        setError('La connexion est lente. Nous avons nettoyé le cache, réessayez.')
       } else {
-        setError("Erreur de chargement. Le cache a été nettoyé.")
+        setError('Erreur de chargement. Le cache a été nettoyé.')
       }
     } finally {
       setLoading(false)
@@ -179,6 +221,7 @@ export default function Tasks() {
 
       const { data: tasksData, error } = await query
       if (error) throw error
+
       setTasks(tasksData || [])
     } catch (error) {
       console.error('Erreur chargement tâches:', error)
@@ -219,7 +262,7 @@ export default function Tasks() {
         status: 'pending',
       })
 
-      const timeoutPromise = new Promise((_, reject) => 
+      const timeoutPromise = new Promise((_, reject) =>
         setTimeout(() => reject(new Error('TIMEOUT_ERROR')), 5000)
       )
 
@@ -238,11 +281,10 @@ export default function Tasks() {
 
       await loadTasksForHousehold(hId)
       setShowModal(false)
-
     } catch (err: any) {
       console.error('Erreur création:', err)
       if (err.message === 'TIMEOUT_ERROR' || err.message?.includes('fetch')) {
-        if(confirm("Connexion perdue. Voulez-vous nettoyer le cache et recharger ?")) {
+        if (confirm('Connexion perdue. Voulez-vous nettoyer le cache et recharger ?')) {
           handleHardRefresh()
         }
       } else {
@@ -255,12 +297,13 @@ export default function Tasks() {
 
   const handleToggleComplete = async (task: Task) => {
     const newStatus = task.status === 'completed' ? 'pending' : 'completed'
-    setTasks(current => current.map(t => t.id === task.id ? { ...t, status: newStatus } : t))
+    setTasks((current) => current.map((t) => (t.id === task.id ? { ...t, status: newStatus } : t)))
     const completedAt = newStatus === 'completed' ? new Date().toISOString() : null
 
-    const { error } = await supabase.from('tasks').update({ 
-        status: newStatus, completed_at: completedAt
-      }).eq('id', task.id)
+    const { error } = await supabase
+      .from('tasks')
+      .update({ status: newStatus, completed_at: completedAt })
+      .eq('id', task.id)
 
     if (error) reloadTasks()
     else if (filter !== 'all') reloadTasks()
@@ -271,18 +314,18 @@ export default function Tasks() {
     try {
       const { error } = await supabase.from('tasks').delete().eq('id', taskId)
       if (error) throw error
-      setTasks(current => current.filter(t => t.id !== taskId))
+      setTasks((current) => current.filter((t) => t.id !== taskId))
     } catch (error) {
       reloadTasks()
     }
   }
 
   const getCategoryStyle = (category: string) => {
-    return CATEGORIES.find(c => c.value === category)?.color || CATEGORIES[0].color
+    return CATEGORIES.find((c) => c.value === category)?.color || CATEGORIES[0].color
   }
 
-  const pendingCount = tasks.filter(t => t.status !== 'completed').length
-  const completedCount = tasks.filter(t => t.status === 'completed').length
+  const pendingCount = tasks.filter((t) => t.status !== 'completed').length
+  const completedCount = tasks.filter((t) => t.status === 'completed').length
 
   if (loading) {
     return (
@@ -295,7 +338,6 @@ export default function Tasks() {
     )
   }
 
-  // --- ECRAN D'ERREUR INTELLIGENT ---
   if (error) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-gray-50 px-4">
@@ -303,15 +345,15 @@ export default function Tasks() {
           <WifiOff className="h-16 w-16 text-red-500 mx-auto mb-4" />
           <h2 className="text-xl font-bold text-gray-900 mb-2">Problème de synchronisation</h2>
           <p className="text-gray-600 mb-6">{error}</p>
-          
-          <button 
+
+          <button
             onClick={handleHardRefresh}
             className="w-full py-3 bg-blue-600 text-white rounded-xl hover:bg-blue-700 transition font-medium shadow-md flex items-center justify-center gap-2"
           >
             <RefreshCw className="w-5 h-5" />
             Réinitialiser la connexion
           </button>
-          
+
           <p className="text-xs text-gray-400 mt-4">
             Ceci va nettoyer le cache local et recharger vos données proprement.
           </p>
@@ -349,7 +391,9 @@ export default function Tasks() {
         <div className="flex justify-between items-center mb-8">
           <div>
             <h2 className="text-3xl font-bold text-gray-900 mb-2">Tâches familiales</h2>
-            <p className="text-gray-600">{pendingCount} en cours • {completedCount} complétées</p>
+            <p className="text-gray-600">
+              {pendingCount} en cours • {completedCount} complétées
+            </p>
           </div>
           <button
             onClick={() => setShowModal(true)}
@@ -360,9 +404,6 @@ export default function Tasks() {
           </button>
         </div>
 
-        {/* ... LE RESTE DU JSX DES FILTRES ET DE LA LISTE RESTE IDENTIQUE ... */}
-        {/* Je remets les filtres ici pour être complet, mais tu n'as pas besoin de changer le code en dessous */}
-        
         <div className="bg-white rounded-xl shadow-sm p-4 mb-6 border border-gray-100">
           <div className="flex flex-wrap gap-4 items-center">
             <div className="flex items-center gap-2">
@@ -370,15 +411,44 @@ export default function Tasks() {
               <span className="text-sm font-medium text-gray-700">Filtres :</span>
             </div>
             <div className="flex gap-2">
-              <button onClick={() => setFilter('all')} className={`px-4 py-2 rounded-lg text-sm font-medium transition ${filter === 'all' ? 'bg-blue-600 text-white' : 'bg-gray-100 text-gray-700 hover:bg-gray-200'}`}>Toutes</button>
-              <button onClick={() => setFilter('pending')} className={`px-4 py-2 rounded-lg text-sm font-medium transition ${filter === 'pending' ? 'bg-blue-600 text-white' : 'bg-gray-100 text-gray-700 hover:bg-gray-200'}`}>En cours</button>
-              <button onClick={() => setFilter('completed')} className={`px-4 py-2 rounded-lg text-sm font-medium transition ${filter === 'completed' ? 'bg-blue-600 text-white' : 'bg-gray-100 text-gray-700 hover:bg-gray-200'}`}>Complétées</button>
+              <button
+                onClick={() => setFilter('all')}
+                className={`px-4 py-2 rounded-lg text-sm font-medium transition ${
+                  filter === 'all' ? 'bg-blue-600 text-white' : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
+                }`}
+              >
+                Toutes
+              </button>
+              <button
+                onClick={() => setFilter('pending')}
+                className={`px-4 py-2 rounded-lg text-sm font-medium transition ${
+                  filter === 'pending' ? 'bg-blue-600 text-white' : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
+                }`}
+              >
+                En cours
+              </button>
+              <button
+                onClick={() => setFilter('completed')}
+                className={`px-4 py-2 rounded-lg text-sm font-medium transition ${
+                  filter === 'completed' ? 'bg-blue-600 text-white' : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
+                }`}
+              >
+                Complétées
+              </button>
             </div>
             <div className="flex gap-2 items-center ml-auto">
               <User className="w-4 h-4 text-gray-500" />
-              <select value={selectedMemberFilter || ''} onChange={(e) => setSelectedMemberFilter(e.target.value || null)} className="px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:border-transparent">
+              <select
+                value={selectedMemberFilter || ''}
+                onChange={(e) => setSelectedMemberFilter(e.target.value || null)}
+                className="px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+              >
                 <option value="">Tous les membres</option>
-                {members.map((member) => (<option key={member.id} value={member.id}>{member.display_name}</option>))}
+                {members.map((member) => (
+                  <option key={member.id} value={member.id}>
+                    {member.display_name}
+                  </option>
+                ))}
               </select>
             </div>
           </div>
@@ -389,29 +459,71 @@ export default function Tasks() {
             <div className="bg-white rounded-xl shadow-sm p-12 text-center border border-gray-100">
               <CheckCircle2 className="w-16 h-16 text-gray-300 mx-auto mb-4" />
               <p className="text-gray-500 mb-2">Aucune tâche pour le moment</p>
-              <p className="text-sm text-gray-400">{filter === 'completed' ? 'Aucune tâche complétée' : 'Crée ta première tâche pour commencer !'}</p>
+              <p className="text-sm text-gray-400">
+                {filter === 'completed' ? 'Aucune tâche complétée' : 'Crée ta première tâche pour commencer !'}
+              </p>
             </div>
           ) : (
             tasks.map((task) => (
-              <div key={task.id} className={`bg-white rounded-xl shadow-sm p-6 border transition hover:shadow-md ${task.status === 'completed' ? 'border-green-200 bg-green-50' : 'border-gray-100'}`}>
+              <div
+                key={task.id}
+                className={`bg-white rounded-xl shadow-sm p-6 border transition hover:shadow-md ${
+                  task.status === 'completed' ? 'border-green-200 bg-green-50' : 'border-gray-100'
+                }`}
+              >
                 <div className="flex items-start gap-4">
                   <button onClick={() => handleToggleComplete(task)} className="mt-1 flex-shrink-0">
-                    {task.status === 'completed' ? (<CheckCircle2 className="w-6 h-6 text-green-600" />) : (<Circle className="w-6 h-6 text-gray-400 hover:text-blue-600 transition" />)}
+                    {task.status === 'completed' ? (
+                      <CheckCircle2 className="w-6 h-6 text-green-600" />
+                    ) : (
+                      <Circle className="w-6 h-6 text-gray-400 hover:text-blue-600 transition" />
+                    )}
                   </button>
+
                   <div className="flex-1">
                     <div className="flex items-start justify-between gap-4">
                       <div className="flex-1">
-                        <h3 className={`text-lg font-semibold mb-1 ${task.status === 'completed' ? 'text-gray-500 line-through' : 'text-gray-900'}`}>{task.title}</h3>
-                        {task.description && (<p className="text-gray-600 text-sm mb-3">{task.description}</p>)}
+                        <h3
+                          className={`text-lg font-semibold mb-1 ${
+                            task.status === 'completed' ? 'text-gray-500 line-through' : 'text-gray-900'
+                          }`}
+                        >
+                          {task.title}
+                        </h3>
+
+                        {task.description && <p className="text-gray-600 text-sm mb-3">{task.description}</p>}
+
                         <div className="flex flex-wrap gap-2 items-center">
-                          <span className={`px-3 py-1 rounded-full text-xs font-medium ${getCategoryStyle(task.category)}`}>{CATEGORIES.find(c => c.value === task.category)?.label}</span>
-                          {task.members && (<span className="flex items-center text-xs text-gray-600"><User className="w-3 h-3 mr-1" />{task.members.display_name}</span>)}
-                          {task.due_date && (<span className="flex items-center text-xs text-gray-600"><Clock className="w-3 h-3 mr-1" />{new Date(task.due_date).toLocaleDateString('fr-FR')}</span>)}
+                          <span className={`px-3 py-1 rounded-full text-xs font-medium ${getCategoryStyle(task.category)}`}>
+                            {CATEGORIES.find((c) => c.value === task.category)?.label}
+                          </span>
+
+                          {task.members && (
+                            <span className="flex items-center text-xs text-gray-600">
+                              <User className="w-3 h-3 mr-1" />
+                              {task.members.display_name}
+                            </span>
+                          )}
+
+                          {task.due_date && (
+                            <span className="flex items-center text-xs text-gray-600">
+                              <Clock className="w-3 h-3 mr-1" />
+                              {new Date(task.due_date).toLocaleDateString('fr-FR')}
+                            </span>
+                          )}
+
                           <span className="text-xs font-medium text-blue-600">{task.points} pts</span>
                         </div>
                       </div>
+
                       <div className="flex gap-2">
-                        <button onClick={() => handleDeleteTask(task.id)} className="p-2 text-red-600 hover:bg-red-50 rounded-lg transition" title="Supprimer"><Trash2 className="w-5 h-5" /></button>
+                        <button
+                          onClick={() => handleDeleteTask(task.id)}
+                          className="p-2 text-red-600 hover:bg-red-50 rounded-lg transition"
+                          title="Supprimer"
+                        >
+                          <Trash2 className="w-5 h-5" />
+                        </button>
                       </div>
                     </div>
                   </div>
@@ -427,46 +539,121 @@ export default function Tasks() {
           <div className="bg-white rounded-2xl shadow-2xl max-w-2xl w-full max-h-[90vh] overflow-y-auto">
             <div className="sticky top-0 bg-white border-b px-6 py-4 flex justify-between items-center">
               <h3 className="text-2xl font-bold text-gray-900">Créer une tâche</h3>
-              <button onClick={() => setShowModal(false)} className="p-2 hover:bg-gray-100 rounded-lg transition" disabled={isSubmitting}><X className="w-5 h-5" /></button>
+              <button onClick={() => setShowModal(false)} className="p-2 hover:bg-gray-100 rounded-lg transition" disabled={isSubmitting}>
+                <X className="w-5 h-5" />
+              </button>
             </div>
+
             <form onSubmit={handleCreateTask} className="p-6 space-y-6">
               <div>
                 <label className="block text-sm font-medium text-gray-700 mb-2">Titre de la tâche *</label>
-                <input type="text" value={formData.title} onChange={(e) => setFormData({ ...formData, title: e.target.value })} placeholder="Ex: Faire les courses" className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent" required disabled={isSubmitting} />
+                <input
+                  type="text"
+                  value={formData.title}
+                  onChange={(e) => setFormData({ ...formData, title: e.target.value })}
+                  placeholder="Ex: Faire les courses"
+                  className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                  required
+                  disabled={isSubmitting}
+                />
               </div>
+
               <div>
                 <label className="block text-sm font-medium text-gray-700 mb-2">Description</label>
-                <textarea value={formData.description} onChange={(e) => setFormData({ ...formData, description: e.target.value })} placeholder="Détails de la tâche..." rows={3} className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent" disabled={isSubmitting} />
+                <textarea
+                  value={formData.description}
+                  onChange={(e) => setFormData({ ...formData, description: e.target.value })}
+                  placeholder="Détails de la tâche..."
+                  rows={3}
+                  className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                  disabled={isSubmitting}
+                />
               </div>
+
               <div className="grid grid-cols-2 gap-4">
                 <div>
                   <label className="block text-sm font-medium text-gray-700 mb-2">Catégorie</label>
-                  <select value={formData.category} onChange={(e) => setFormData({ ...formData, category: e.target.value })} className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent" disabled={isSubmitting}>
-                    {CATEGORIES.map((cat) => (<option key={cat.value} value={cat.value}>{cat.label}</option>))}
+                  <select
+                    value={formData.category}
+                    onChange={(e) => setFormData({ ...formData, category: e.target.value })}
+                    className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                    disabled={isSubmitting}
+                  >
+                    {CATEGORIES.map((cat) => (
+                      <option key={cat.value} value={cat.value}>
+                        {cat.label}
+                      </option>
+                    ))}
                   </select>
                 </div>
+
                 <div>
                   <label className="block text-sm font-medium text-gray-700 mb-2">Assigner à</label>
-                  <select value={formData.assigned_to} onChange={(e) => setFormData({ ...formData, assigned_to: e.target.value })} className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent" disabled={isSubmitting}>
+                  <select
+                    value={formData.assigned_to}
+                    onChange={(e) => setFormData({ ...formData, assigned_to: e.target.value })}
+                    className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                    disabled={isSubmitting}
+                  >
                     <option value="">Non assigné</option>
-                    {members.map((member) => (<option key={member.id} value={member.id}>{member.display_name}</option>))}
+                    {members.map((member) => (
+                      <option key={member.id} value={member.id}>
+                        {member.display_name}
+                      </option>
+                    ))}
                   </select>
                 </div>
               </div>
+
               <div className="grid grid-cols-2 gap-4">
                 <div>
                   <label className="block text-sm font-medium text-gray-700 mb-2">Date d'échéance</label>
-                  <input type="date" value={formData.due_date} onChange={(e) => setFormData({ ...formData, due_date: e.target.value })} className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent" disabled={isSubmitting} />
+                  <input
+                    type="date"
+                    value={formData.due_date}
+                    onChange={(e) => setFormData({ ...formData, due_date: e.target.value })}
+                    className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                    disabled={isSubmitting}
+                  />
                 </div>
+
                 <div>
                   <label className="block text-sm font-medium text-gray-700 mb-2">Points</label>
-                  <input type="number" value={formData.points} onChange={(e) => setFormData({ ...formData, points: parseInt(e.target.value) })} min="1" max="100" className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent" disabled={isSubmitting} />
+                  <input
+                    type="number"
+                    value={formData.points}
+                    onChange={(e) => setFormData({ ...formData, points: parseInt(e.target.value) || 1 })}
+                    min="1"
+                    max="100"
+                    className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                    disabled={isSubmitting}
+                  />
                 </div>
               </div>
+
               <div className="flex gap-3 pt-4">
-                <button type="button" onClick={() => setShowModal(false)} className="flex-1 px-6 py-3 border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50 transition font-medium" disabled={isSubmitting}>Annuler</button>
-                <button type="submit" disabled={isSubmitting} className="flex-1 px-6 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition font-medium disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center">
-                  {isSubmitting ? (<><Loader2 className="w-5 h-5 mr-2 animate-spin" />Création...</>) : ('Créer la tâche')}
+                <button
+                  type="button"
+                  onClick={() => setShowModal(false)}
+                  className="flex-1 px-6 py-3 border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50 transition font-medium"
+                  disabled={isSubmitting}
+                >
+                  Annuler
+                </button>
+
+                <button
+                  type="submit"
+                  disabled={isSubmitting}
+                  className="flex-1 px-6 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition font-medium disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center"
+                >
+                  {isSubmitting ? (
+                    <>
+                      <Loader2 className="w-5 h-5 mr-2 animate-spin" />
+                      Création...
+                    </>
+                  ) : (
+                    'Créer la tâche'
+                  )}
                 </button>
               </div>
             </form>
