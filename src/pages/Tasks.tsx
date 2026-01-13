@@ -13,7 +13,7 @@ import {
   User,
   Filter,
   X,
-  Loader2 // J'ai ajouté l'icône de chargement
+  Loader2
 } from 'lucide-react'
 
 interface Task {
@@ -67,7 +67,7 @@ export default function Tasks() {
   // States d'interface
   const [loading, setLoading] = useState(true)
   const [showModal, setShowModal] = useState(false)
-  const [isSubmitting, setIsSubmitting] = useState(false) // NOUVEAU : Pour bloquer le bouton
+  const [isSubmitting, setIsSubmitting] = useState(false)
   const [filter, setFilter] = useState<'all' | 'pending' | 'completed'>('pending')
   const [selectedMemberFilter, setSelectedMemberFilter] = useState<string | null>(null)
   
@@ -147,8 +147,6 @@ export default function Tasks() {
   // Fonction centrale de rechargement des tâches
   const loadTasksForHousehold = async (targetHouseholdId: string) => {
     try {
-      console.log("📥 Chargement des tâches pour:", targetHouseholdId)
-      
       let query = supabase
         .from('tasks')
         .select(`
@@ -174,7 +172,6 @@ export default function Tasks() {
       if (error) throw error
 
       setTasks(tasksData || [])
-      console.log("✅ Tâches chargées:", tasksData?.length)
     } catch (error) {
       console.error('Erreur chargement tâches:', error)
     }
@@ -193,23 +190,25 @@ export default function Tasks() {
     navigate('/login')
   }
 
-  // --- CRÉATION DE TÂCHE CORRIGÉE ---
+  // --- CRÉATION DE TÂCHE AVEC SÉCURITÉ TIMEOUT ---
   const handleCreateTask = async (e: React.FormEvent) => {
     e.preventDefault()
     
-    // 1. Bloquer les doubles clics
+    // Bloquer les doubles clics
     if (isSubmitting) return
     setIsSubmitting(true)
 
     try {
       if (!user) throw new Error('Utilisateur non connecté')
 
-      // 2. Récupération robuste de l'ID
+      // Récupération robuste de l'ID
       const hId = householdId || localStorage.getItem('homeflow_household_id')
       if (!hId) throw new Error('Impossible de retrouver votre famille. Veuillez recharger la page.')
 
-      // 3. Insertion
-      const { error } = await supabase.from('tasks').insert({
+      // --- SÉCURITÉ TIMEOUT : On force une erreur si ça prend plus de 5 secondes ---
+      
+      // 1. La requête Supabase
+      const insertPromise = supabase.from('tasks').insert({
         household_id: hId,
         title: formData.title,
         description: formData.description || null,
@@ -221,9 +220,20 @@ export default function Tasks() {
         status: 'pending',
       })
 
-      if (error) throw error
+      // 2. Le chronomètre (5 secondes)
+      const timeoutPromise = new Promise((_, reject) => 
+        setTimeout(() => reject(new Error('TIMEOUT_ERROR')), 5000)
+      )
 
-      // 4. Succès : On vide le formulaire
+      // 3. On lance la course
+      // @ts-ignore
+      const result: any = await Promise.race([insertPromise, timeoutPromise])
+
+      if (result.error) throw result.error
+
+      // --- SUCCÈS ---
+
+      // Vider le formulaire
       setFormData({
         title: '',
         description: '',
@@ -233,16 +243,23 @@ export default function Tasks() {
         points: 10,
       })
 
-      // 5. IMPORTANT : On recharge les données AVANT de fermer la modale
-      // Cela garantit que la tâche s'affiche quand la fenêtre disparaît
+      // Recharger les données AVANT de fermer la modale
       await loadTasksForHousehold(hId)
       
-      // 6. Fermeture propre
+      // Fermeture propre
       setShowModal(false)
 
     } catch (err: any) {
       console.error('Erreur création:', err)
-      alert(err.message || 'Une erreur est survenue')
+      
+      // Gestion spécifique du cas "Connexion perdue / Onglet endormi"
+      if (err.message === 'TIMEOUT_ERROR' || err.message?.includes('fetch')) {
+        if(confirm("La connexion semble instable (probablement due à la mise en veille de l'onglet). Voulez-vous recharger la page pour reconnecter ?")) {
+          window.location.reload()
+        }
+      } else {
+        alert(err.message || 'Une erreur est survenue lors de la création')
+      }
     } finally {
       // Quoi qu'il arrive, on débloque le bouton
       setIsSubmitting(false)
@@ -253,7 +270,6 @@ export default function Tasks() {
     // Optimistic UI update (mise à jour visuelle immédiate)
     const newStatus = task.status === 'completed' ? 'pending' : 'completed'
     
-    // On met à jour l'interface locale tout de suite pour la réactivité
     setTasks(currentTasks => 
       currentTasks.map(t => 
         t.id === task.id ? { ...t, status: newStatus } : t
@@ -271,11 +287,9 @@ export default function Tasks() {
       .eq('id', task.id)
 
     if (error) {
-      // Si erreur serveur, on revient en arrière (rollback)
       console.error("Erreur update task", error)
-      reloadTasks()
+      reloadTasks() // En cas d'erreur, on annule l'effet visuel en rechargeant
     } else {
-      // Si on filtre par statut, il faut recharger pour que la tâche disparaisse/apparaisse correctement
       if (filter !== 'all') {
          reloadTasks()
       }
@@ -293,7 +307,6 @@ export default function Tasks() {
 
       if (error) throw error
       
-      // Suppression locale immédiate
       setTasks(current => current.filter(t => t.id !== taskId))
       
     } catch (error) {
