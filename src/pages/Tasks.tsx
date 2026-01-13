@@ -280,12 +280,9 @@ export default function Tasks() {
       // Fermer le modal AVANT de recharger (pour éviter les bugs visuels)
       setShowModal(false)
       
-      // Forcer le rechargement immédiat des tâches
-      const hId = householdId || localStorage.getItem('homeflow_household_id')
-      if (hId) {
-        console.log('🔄 Force reload tasks with householdId:', hId)
-        await loadTasksForHousehold(hId)
-      }
+      // Forcer le rechargement immédiat des tâches avec le même hId
+      console.log('🔄 Force reload tasks with householdId:', hId)
+      await loadTasksForHousehold(hId)
       
       console.log('✅ handleCreateTask - COMPLETE')
     } catch (err: any) {
