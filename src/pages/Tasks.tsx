@@ -12,7 +12,8 @@ import {
   Clock,
   User,
   Filter,
-  X
+  X,
+  Loader2 // J'ai ajouté l'icône de chargement
 } from 'lucide-react'
 
 interface Task {
@@ -56,16 +57,21 @@ const CATEGORIES = [
 export default function Tasks() {
   const navigate = useNavigate()
   const { user, setUser } = useAuthStore()
+  
+  // States de données
   const [tasks, setTasks] = useState<Task[]>([])
   const [members, setMembers] = useState<Member[]>([])
   const [household, setHousehold] = useState<Household | null>(null)
   const [householdId, setHouseholdId] = useState<string | null>(null)
+  
+  // States d'interface
   const [loading, setLoading] = useState(true)
   const [showModal, setShowModal] = useState(false)
+  const [isSubmitting, setIsSubmitting] = useState(false) // NOUVEAU : Pour bloquer le bouton
   const [filter, setFilter] = useState<'all' | 'pending' | 'completed'>('pending')
   const [selectedMemberFilter, setSelectedMemberFilter] = useState<string | null>(null)
   
-  // Ref pour éviter les rechargements multiples
+  // Ref pour éviter les rechargements multiples au démarrage
   const hasLoadedData = useRef(false)
 
   // Form state
@@ -78,113 +84,81 @@ export default function Tasks() {
     points: 10,
   })
 
+  // 1. Premier chargement
   useEffect(() => {
-    // Ne charger qu'une seule fois
     if (!hasLoadedData.current && user) {
-      console.log('🔄 First load - calling loadInitialData')
       hasLoadedData.current = true
       loadInitialData()
     }
   }, [user])
 
+  // 2. Rechargement sur changement de filtre (uniquement si déjà chargé)
   useEffect(() => {
-    // Recharger les tâches seulement quand les filtres changent
-    // ET que les données initiales sont déjà chargées
-    if (hasLoadedData.current && householdId) {
-      console.log('🔄 Filters changed - reloading tasks')
-      loadTasks()
+    const safeHouseholdId = householdId || localStorage.getItem('homeflow_household_id')
+    if (hasLoadedData.current && safeHouseholdId) {
+      loadTasksForHousehold(safeHouseholdId)
     }
-  }, [filter, selectedMemberFilter])  // ← Retiré householdId des dépendances !
+  }, [filter, selectedMemberFilter]) 
 
   const loadInitialData = async () => {
-    console.log('🔄 loadInitialData - START')
     if (!user) {
-      console.log('❌ loadInitialData - NO USER')
       setLoading(false)
       return
     }
 
     try {
-      console.log('📊 loadInitialData - Fetching member data...')
+      // Récupérer les infos du membre et de la famille
       const { data: memberData, error: memberError } = await supabase
         .from('members')
         .select('household_id, households(id, name)')
         .eq('id', user.id)
         .single()
 
-      if (memberError) {
-        console.error('❌ loadInitialData - Member error:', memberError)
-        throw memberError
-      }
-
-      if (!memberData) {
-        console.log('❌ loadInitialData - NO MEMBER DATA')
-        setLoading(false)
-        return
-      }
-
-      console.log('✅ loadInitialData - Member data:', memberData)
+      if (memberError || !memberData) throw memberError || new Error('No member data')
 
       const householdData = memberData.households as any
-      const householdInfo = {
-        id: householdData.id,
-        name: householdData.name
-      }
-      
-      console.log('🏠 loadInitialData - Setting household:', householdInfo)
-      setHousehold(householdInfo)
-      setHouseholdId(householdData.id)
-      
-      // Sauvegarder dans localStorage pour persistence
-      localStorage.setItem('homeflow_household_id', householdData.id)
-      console.log('💾 loadInitialData - Saved to localStorage')
+      const hId = householdData.id
 
-      // Récupérer tous les membres du foyer
-      console.log('👥 loadInitialData - Fetching members...')
+      // Mises à jour du state
+      setHousehold({ id: hId, name: householdData.name })
+      setHouseholdId(hId)
+      
+      // SAUVEGARDE DE SECOURS DANS LE STORAGE
+      localStorage.setItem('homeflow_household_id', hId)
+
+      // Récupérer les membres
       const { data: membersData } = await supabase
         .from('members')
         .select('id, display_name')
         .eq('household_id', memberData.household_id)
-
-      console.log('✅ loadInitialData - Members:', membersData)
+      
       setMembers(membersData || [])
 
-      // Charger les tâches initiales
-      console.log('📋 loadInitialData - Loading tasks...')
-      await loadTasksForHousehold(householdData.id)
-      console.log('✅ loadInitialData - COMPLETE')
+      // Charger les tâches
+      await loadTasksForHousehold(hId)
+
     } catch (error) {
-      console.error('💥 loadInitialData - ERROR:', error)
+      console.error('Erreur chargement initial:', error)
     } finally {
-      console.log('🏁 loadInitialData - Setting loading to false')
       setLoading(false)
     }
   }
 
-  const loadTasks = async () => {
-    console.log('🔄 loadTasks - START')
-    const hId = householdId || localStorage.getItem('homeflow_household_id')
-    console.log('🏠 loadTasks - householdId:', hId)
-    if (!hId) {
-      console.log('❌ loadTasks - NO HOUSEHOLD ID')
-      return
-    }
-    await loadTasksForHousehold(hId)
-    console.log('✅ loadTasks - COMPLETE')
-  }
-
-  const loadTasksForHousehold = async (householdId: string) => {
-    console.log('📋 loadTasksForHousehold - START for:', householdId)
+  // Fonction centrale de rechargement des tâches
+  const loadTasksForHousehold = async (targetHouseholdId: string) => {
     try {
+      console.log("📥 Chargement des tâches pour:", targetHouseholdId)
+      
       let query = supabase
         .from('tasks')
         .select(`
           *,
           members:assigned_to(display_name)
         `)
-        .eq('household_id', householdId)
+        .eq('household_id', targetHouseholdId)
         .order('created_at', { ascending: false })
 
+      // Application des filtres
       if (filter === 'pending') {
         query = query.in('status', ['pending', 'in_progress'])
       } else if (filter === 'completed') {
@@ -195,57 +169,46 @@ export default function Tasks() {
         query = query.eq('assigned_to', selectedMemberFilter)
       }
 
-      console.log('📊 loadTasksForHousehold - Executing query...')
       const { data: tasksData, error } = await query
 
-      if (error) {
-        console.error('❌ loadTasksForHousehold - ERROR:', error)
-        throw error
-      }
+      if (error) throw error
 
-      console.log('✅ loadTasksForHousehold - Tasks loaded:', tasksData?.length || 0)
       setTasks(tasksData || [])
+      console.log("✅ Tâches chargées:", tasksData?.length)
     } catch (error) {
-      console.error('💥 loadTasksForHousehold - ERROR:', error)
+      console.error('Erreur chargement tâches:', error)
     }
   }
 
+  // Wrapper simple pour recharger
+  const reloadTasks = async () => {
+    const hId = householdId || localStorage.getItem('homeflow_household_id')
+    if (hId) await loadTasksForHousehold(hId)
+  }
+
   const handleLogout = async () => {
-    // Nettoyer le localStorage avant déconnexion
     localStorage.removeItem('homeflow_household_id')
     await supabase.auth.signOut()
     setUser(null)
     navigate('/login')
   }
 
+  // --- CRÉATION DE TÂCHE CORRIGÉE ---
   const handleCreateTask = async (e: React.FormEvent) => {
     e.preventDefault()
     
-    console.log('🎯 handleCreateTask - CLICKED!')
-    console.log('👤 User:', user ? 'exists' : 'NULL')
-    console.log('🏠 State householdId:', householdId)
-    console.log('💾 localStorage householdId:', localStorage.getItem('homeflow_household_id'))
-
-    if (!user) {
-      console.error('❌ NO USER')
-      alert('Utilisateur non connecté')
-      return
-    }
-
-    const hId = householdId || localStorage.getItem('homeflow_household_id')
-    
-    console.log('🔑 Final householdId to use:', hId)
-    
-    if (!hId) {
-      console.error('❌ NO HOUSEHOLD ID')
-      alert('Foyer non trouvé. Veuillez rafraîchir la page.')
-      return
-    }
-
-    console.log('📝 Form data:', formData)
+    // 1. Bloquer les doubles clics
+    if (isSubmitting) return
+    setIsSubmitting(true)
 
     try {
-      console.log('💾 Inserting task into Supabase...')
+      if (!user) throw new Error('Utilisateur non connecté')
+
+      // 2. Récupération robuste de l'ID
+      const hId = householdId || localStorage.getItem('homeflow_household_id')
+      if (!hId) throw new Error('Impossible de retrouver votre famille. Veuillez recharger la page.')
+
+      // 3. Insertion
       const { error } = await supabase.from('tasks').insert({
         household_id: hId,
         title: formData.title,
@@ -258,14 +221,9 @@ export default function Tasks() {
         status: 'pending',
       })
 
-      if (error) {
-        console.error('❌ Supabase error:', error)
-        throw error
-      }
+      if (error) throw error
 
-      console.log('✅ Task created successfully!')
-
-      // Réinitialiser le formulaire
+      // 4. Succès : On vide le formulaire
       setFormData({
         title: '',
         description: '',
@@ -274,25 +232,34 @@ export default function Tasks() {
         due_date: '',
         points: 10,
       })
-      
-      console.log('🔄 Closing modal and reloading tasks...')
-      
-      // Fermer le modal AVANT de recharger (pour éviter les bugs visuels)
-      setShowModal(false)
-      
-      // Forcer le rechargement immédiat des tâches avec le même hId
-      console.log('🔄 Force reload tasks with householdId:', hId)
+
+      // 5. IMPORTANT : On recharge les données AVANT de fermer la modale
+      // Cela garantit que la tâche s'affiche quand la fenêtre disparaît
       await loadTasksForHousehold(hId)
       
-      console.log('✅ handleCreateTask - COMPLETE')
+      // 6. Fermeture propre
+      setShowModal(false)
+
     } catch (err: any) {
-      console.error('💥 Error in handleCreateTask:', err)
-      alert('Erreur lors de la création de la tâche: ' + (err.message || 'Erreur inconnue'))
+      console.error('Erreur création:', err)
+      alert(err.message || 'Une erreur est survenue')
+    } finally {
+      // Quoi qu'il arrive, on débloque le bouton
+      setIsSubmitting(false)
     }
   }
 
   const handleToggleComplete = async (task: Task) => {
+    // Optimistic UI update (mise à jour visuelle immédiate)
     const newStatus = task.status === 'completed' ? 'pending' : 'completed'
+    
+    // On met à jour l'interface locale tout de suite pour la réactivité
+    setTasks(currentTasks => 
+      currentTasks.map(t => 
+        t.id === task.id ? { ...t, status: newStatus } : t
+      )
+    )
+
     const completedAt = newStatus === 'completed' ? new Date().toISOString() : null
 
     const { error } = await supabase
@@ -303,21 +270,35 @@ export default function Tasks() {
       })
       .eq('id', task.id)
 
-    if (!error) {
-      await loadTasks()
+    if (error) {
+      // Si erreur serveur, on revient en arrière (rollback)
+      console.error("Erreur update task", error)
+      reloadTasks()
+    } else {
+      // Si on filtre par statut, il faut recharger pour que la tâche disparaisse/apparaisse correctement
+      if (filter !== 'all') {
+         reloadTasks()
+      }
     }
   }
 
   const handleDeleteTask = async (taskId: string) => {
     if (!confirm('Es-tu sûr de vouloir supprimer cette tâche ?')) return
 
-    const { error } = await supabase
-      .from('tasks')
-      .delete()
-      .eq('id', taskId)
+    try {
+      const { error } = await supabase
+        .from('tasks')
+        .delete()
+        .eq('id', taskId)
 
-    if (!error) {
-      await loadTasks()
+      if (error) throw error
+      
+      // Suppression locale immédiate
+      setTasks(current => current.filter(t => t.id !== taskId))
+      
+    } catch (error) {
+      console.error("Erreur suppression", error)
+      reloadTasks()
     }
   }
 
@@ -332,7 +313,7 @@ export default function Tasks() {
     return (
       <div className="min-h-screen flex items-center justify-center bg-gray-50">
         <div className="text-center">
-          <div className="inline-block h-12 w-12 animate-spin rounded-full border-4 border-solid border-blue-600 border-r-transparent"></div>
+          <Loader2 className="h-12 w-12 animate-spin text-blue-600 mx-auto" />
           <p className="mt-4 text-lg font-medium text-gray-700">Chargement...</p>
         </div>
       </div>
@@ -540,6 +521,7 @@ export default function Tasks() {
               <button
                 onClick={() => setShowModal(false)}
                 className="p-2 hover:bg-gray-100 rounded-lg transition"
+                disabled={isSubmitting}
               >
                 <X className="w-5 h-5" />
               </button>
@@ -557,6 +539,7 @@ export default function Tasks() {
                   placeholder="Ex: Faire les courses"
                   className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
                   required
+                  disabled={isSubmitting}
                 />
               </div>
 
@@ -570,6 +553,7 @@ export default function Tasks() {
                   placeholder="Détails de la tâche..."
                   rows={3}
                   className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                  disabled={isSubmitting}
                 />
               </div>
 
@@ -582,6 +566,7 @@ export default function Tasks() {
                     value={formData.category}
                     onChange={(e) => setFormData({ ...formData, category: e.target.value })}
                     className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                    disabled={isSubmitting}
                   >
                     {CATEGORIES.map((cat) => (
                       <option key={cat.value} value={cat.value}>
@@ -599,6 +584,7 @@ export default function Tasks() {
                     value={formData.assigned_to}
                     onChange={(e) => setFormData({ ...formData, assigned_to: e.target.value })}
                     className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                    disabled={isSubmitting}
                   >
                     <option value="">Non assigné</option>
                     {members.map((member) => (
@@ -620,6 +606,7 @@ export default function Tasks() {
                     value={formData.due_date}
                     onChange={(e) => setFormData({ ...formData, due_date: e.target.value })}
                     className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                    disabled={isSubmitting}
                   />
                 </div>
 
@@ -634,6 +621,7 @@ export default function Tasks() {
                     min="1"
                     max="100"
                     className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                    disabled={isSubmitting}
                   />
                 </div>
               </div>
@@ -643,14 +631,23 @@ export default function Tasks() {
                   type="button"
                   onClick={() => setShowModal(false)}
                   className="flex-1 px-6 py-3 border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50 transition font-medium"
+                  disabled={isSubmitting}
                 >
                   Annuler
                 </button>
                 <button
                   type="submit"
-                  className="flex-1 px-6 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition font-medium"
+                  disabled={isSubmitting}
+                  className="flex-1 px-6 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition font-medium disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center"
                 >
-                  Créer la tâche
+                  {isSubmitting ? (
+                    <>
+                      <Loader2 className="w-5 h-5 mr-2 animate-spin" />
+                      Création...
+                    </>
+                  ) : (
+                    'Créer la tâche'
+                  )}
                 </button>
               </div>
             </form>
