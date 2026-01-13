@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useState, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { supabase } from '@/lib/supabase'
 import { useAuthStore } from '@/store/authStore'
@@ -64,6 +64,9 @@ export default function Tasks() {
   const [showModal, setShowModal] = useState(false)
   const [filter, setFilter] = useState<'all' | 'pending' | 'completed'>('pending')
   const [selectedMemberFilter, setSelectedMemberFilter] = useState<string | null>(null)
+  
+  // Ref pour éviter les rechargements multiples
+  const hasLoadedData = useRef(false)
 
   // Form state
   const [formData, setFormData] = useState({
@@ -76,14 +79,22 @@ export default function Tasks() {
   })
 
   useEffect(() => {
-    loadInitialData()
+    // Ne charger qu'une seule fois
+    if (!hasLoadedData.current && user) {
+      console.log('🔄 First load - calling loadInitialData')
+      hasLoadedData.current = true
+      loadInitialData()
+    }
   }, [user])
 
   useEffect(() => {
-    if (householdId) {
+    // Recharger les tâches seulement quand les filtres changent
+    // ET que les données initiales sont déjà chargées
+    if (hasLoadedData.current && householdId) {
+      console.log('🔄 Filters changed - reloading tasks')
       loadTasks()
     }
-  }, [filter, selectedMemberFilter, householdId])
+  }, [filter, selectedMemberFilter])  // ← Retiré householdId des dépendances !
 
   const loadInitialData = async () => {
     console.log('🔄 loadInitialData - START')
