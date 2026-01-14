@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { supabase } from '@/lib/supabase'
 import { useAuthStore } from '@/store/authStore'
@@ -16,9 +16,18 @@ import {
   Loader2,
   WifiOff,
   RefreshCw,
+  AlertTriangle,
 } from 'lucide-react'
 
-/** ========= Types ========= */
+/**
+ * ✅ ROBUST Tasks.tsx
+ * - init robuste (getSession + getUser + auth listener)
+ * - timeouts sur appels Supabase
+ * - écran erreur + retry + hard reset
+ * - création tâche : timeout + reset UI garanti + refresh tasks
+ * - évite les loaders infinis
+ */
+
 interface Task {
   id: string
   title: string
@@ -31,7 +40,7 @@ interface Task {
   due_date: string | null
   completed_at: string | null
   created_at: string
-  household_id: string
+  household_id?: string
   members?: {
     display_name: string
   } | null
@@ -40,15 +49,13 @@ interface Task {
 interface Member {
   id: string
   display_name: string
+  household_id?: string
 }
 
 interface Household {
   id: string
   name: string
 }
-
-/** ========= Const ========= */
-const STORAGE_KEY = 'homeflow_household_id'
 
 const CATEGORIES = [
   { value: 'general', label: 'Général', color: 'bg-gray-100 text-gray-700' },
@@ -61,35 +68,46 @@ const CATEGORIES = [
   { value: 'autre', label: 'Autre', color: 'bg-pink-100 text-pink-700' },
 ]
 
-/** ========= Helpers ========= */
-function withTimeout<T>(promise: Promise<T>, ms: number, label = 'TIMEOUT') {
-  let timer: any
-  const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new Error(label)), ms)
-  })
-  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer)) as Promise<T>
+const LS_HOUSEHOLD_ID_KEY = 'homeflow_household_id'
+
+function timeout(ms: number) {
+  return new Promise((_, reject) => setTimeout(() => reject(new Error('TIMEOUT')), ms))
+}
+
+async function withTimeout<T>(promise: Promise<T>, ms: number, code: string): Promise<T> {
+  try {
+    return (await Promise.race([promise, timeout(ms)])) as T
+  } catch (e: any) {
+    // tag l’erreur
+    const err = e instanceof Error ? e : new Error(String(e))
+    ;(err as any).code = (err as any).code || code
+    // si c’est le timeout() interne :
+    if (err.message === 'TIMEOUT') (err as any).code = code
+    throw err
+  }
 }
 
 export default function Tasks() {
   const navigate = useNavigate()
   const { user, setUser } = useAuthStore()
 
-  const [tasks, setTasks] = useState<Task[]>([])
-  const [members, setMembers] = useState<Member[]>([])
-  const [household, setHousehold] = useState<Household | null>(null)
-  const [householdId, setHouseholdId] = useState<string | null>(null)
+  const mountedRef = useRef(true)
+  const initInFlightRef = useRef(false)
 
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+
+  const [household, setHousehold] = useState<Household | null>(null)
+  const [householdId, setHouseholdId] = useState<string | null>(null)
+
+  const [tasks, setTasks] = useState<Task[]>([])
+  const [members, setMembers] = useState<Member[]>([])
 
   const [showModal, setShowModal] = useState(false)
   const [isSubmitting, setIsSubmitting] = useState(false)
 
   const [filter, setFilter] = useState<'all' | 'pending' | 'completed'>('pending')
   const [selectedMemberFilter, setSelectedMemberFilter] = useState<string | null>(null)
-
-  const mountedRef = useRef(true)
-  const didInitRef = useRef(false)
 
   const [formData, setFormData] = useState({
     title: '',
@@ -100,6 +118,162 @@ export default function Tasks() {
     points: 10,
   })
 
+  const safeSet = useCallback(<T,>(setter: React.Dispatch<React.SetStateAction<T>>, value: React.SetStateAction<T>) => {
+    if (mountedRef.current) setter(value)
+  }, [])
+
+  const hardReset = useCallback(() => {
+    try {
+      localStorage.removeItem(LS_HOUSEHOLD_ID_KEY)
+    } catch {
+      // ignore
+    }
+    window.location.reload()
+  }, [])
+
+  const logout = useCallback(async () => {
+    try {
+      localStorage.removeItem(LS_HOUSEHOLD_ID_KEY)
+    } catch {
+      // ignore
+    }
+    await supabase.auth.signOut()
+    setUser(null)
+    navigate('/login')
+  }, [navigate, setUser])
+
+  const getCategoryStyle = useCallback((category: string) => {
+    return CATEGORIES.find((c) => c.value === category)?.color || CATEGORIES[0].color
+  }, [])
+
+  const pendingCount = useMemo(() => tasks.filter((t) => t.status !== 'completed').length, [tasks])
+  const completedCount = useMemo(() => tasks.filter((t) => t.status === 'completed').length, [tasks])
+
+  const loadTasksForHousehold = useCallback(
+    async (targetHouseholdId: string) => {
+      let query = supabase
+        .from('tasks')
+        .select('*, members:assigned_to(display_name)')
+        .eq('household_id', targetHouseholdId)
+        .order('created_at', { ascending: false })
+
+      if (filter === 'pending') query = query.in('status', ['pending', 'in_progress'])
+      else if (filter === 'completed') query = query.eq('status', 'completed')
+
+      if (selectedMemberFilter) query = query.eq('assigned_to', selectedMemberFilter)
+
+      const { data, error: qErr } = await withTimeout(query, 12000, 'TASKS_TIMEOUT')
+      if (qErr) throw qErr
+
+      safeSet(setTasks, (data as Task[]) || [])
+    },
+    [filter, safeSet, selectedMemberFilter]
+  )
+
+  const loadInitialData = useCallback(
+    async (userId: string) => {
+      // 1) récupère household via member
+      const memberQuery = supabase
+        .from('members')
+        .select('household_id, households(id, name)')
+        .eq('id', userId)
+        .single()
+
+      const { data: memberData, error: memberError } = await withTimeout(memberQuery, 12000, 'MEMBER_TIMEOUT')
+      if (memberError || !memberData) throw memberError || new Error('Aucune donnée membre')
+
+      const householdData = memberData.households as any
+      const hId = householdData?.id as string | undefined
+      const hName = householdData?.name as string | undefined
+      if (!hId) throw new Error('Household introuvable')
+
+      safeSet(setHousehold, { id: hId, name: hName || 'Famille' })
+      safeSet(setHouseholdId, hId)
+
+      // 2) cache pour fallback (mais on ne DOIT jamais dépendre uniquement du cache)
+      try {
+        localStorage.setItem(LS_HOUSEHOLD_ID_KEY, hId)
+      } catch {
+        // ignore
+      }
+
+      // 3) membres household
+      const membersQuery = supabase
+        .from('members')
+        .select('id, display_name')
+        .eq('household_id', memberData.household_id)
+
+      const { data: membersData, error: membersError } = await withTimeout(membersQuery, 12000, 'MEMBERS_TIMEOUT')
+      if (membersError) throw membersError
+      safeSet(setMembers, (membersData as Member[]) || [])
+
+      // 4) tasks
+      await loadTasksForHousehold(hId)
+    },
+    [loadTasksForHousehold, safeSet]
+  )
+
+  const init = useCallback(async () => {
+    if (initInFlightRef.current) return
+    initInFlightRef.current = true
+
+    safeSet(setLoading, true)
+    safeSet(setError, null)
+
+    try {
+      // A) si store vide, on tente session
+      if (!user) {
+        const sessionRes = await withTimeout(supabase.auth.getSession(), 10000, 'SESSION_TIMEOUT')
+        const sessionUser = sessionRes.data.session?.user ?? null
+        if (sessionUser) setUser(sessionUser)
+      }
+
+      // B) user "source de vérité"
+      const userRes = await withTimeout(supabase.auth.getUser(), 10000, 'GETUSER_TIMEOUT')
+      const currentUser = userRes.data.user
+      if (!currentUser) {
+        safeSet(setLoading, false)
+        navigate('/login')
+        return
+      }
+
+      // C) charge data
+      await loadInitialData(currentUser.id)
+
+      safeSet(setLoading, false)
+    } catch (e: any) {
+      console.error('[Tasks:init] error', e)
+
+      // Si cache potentiellement pourri, on le supprime (mais on ne reload pas automatiquement)
+      try {
+        localStorage.removeItem(LS_HOUSEHOLD_ID_KEY)
+      } catch {
+        // ignore
+      }
+
+      const code = e?.code || e?.message
+      const msg =
+        code === 'SESSION_TIMEOUT' || code === 'GETUSER_TIMEOUT'
+          ? 'Connexion lente : impossible de valider la session. Clique sur Réessayer.'
+          : code === 'MEMBER_TIMEOUT' || code === 'MEMBERS_TIMEOUT'
+          ? 'Impossible de charger les données famille/membres. Clique sur Réessayer.'
+          : code === 'TASKS_TIMEOUT'
+          ? 'Impossible de charger les tâches. Clique sur Réessayer.'
+          : 'Erreur de synchronisation. Clique sur Réessayer (ou Hard Reset).'
+
+      safeSet(setError, msg)
+      safeSet(setLoading, false)
+    } finally {
+      initInFlightRef.current = false
+    }
+  }, [loadInitialData, navigate, safeSet, setUser, user])
+
+  const retry = useCallback(() => {
+    // reset UI + relance init
+    safeSet(setError, null)
+    init()
+  }, [init, safeSet])
+
   useEffect(() => {
     mountedRef.current = true
     return () => {
@@ -107,173 +281,68 @@ export default function Tasks() {
     }
   }, [])
 
-  const safeSetState = <T,>(setter: (v: T) => void, value: T) => {
-    if (mountedRef.current) setter(value)
-  }
-
-  const getCategoryStyle = (category: string) =>
-    CATEGORIES.find((c) => c.value === category)?.color || CATEGORIES[0].color
-
-  const pendingCount = useMemo(() => tasks.filter((t) => t.status !== 'completed').length, [tasks])
-  const completedCount = useMemo(() => tasks.filter((t) => t.status === 'completed').length, [tasks])
-
-  const hardReset = () => {
-    console.log('🧹 Hard reset (cache household + reload)')
-    localStorage.removeItem(STORAGE_KEY)
-    window.location.reload()
-  }
-
-  /** ========= Auth/session guard =========
-   * Important en prod : parfois ton store a user=null au premier render.
-   * On tente de récupérer la session Supabase pour éviter le "loading infini".
-   */
+  // Auth listener (robuste après retour d’onglet / refresh tokens)
   useEffect(() => {
-    if (didInitRef.current) return
-    didInitRef.current = true
-
-    const init = async () => {
-      try {
-        setLoading(true)
-        setError(null)
-
-        // 1) Si le store n’a pas encore user, on tente getSession()
-        if (!user) {
-          const { data } = awaitẮ withTimeout(supabase.auth.getSession(), 8000, 'SESSION_TIMEOUT')
-          const sessionUser = data.session?.user ?? null
-          if (sessionUser) setUser(sessionUser)
-        }
-
-        // 2) Si toujours pas user => go login (pas de spinner infini)
-        const currentUser = user ?? (await supabase.auth.getUser()).data.user
-        if (!currentUser) {
-          setLoading(false)
-          navigate('/login')
-          return
-        }
-
-        // 3) Charger données
-        await loadInitialData(currentUser.id)
-        safeSetState(setLoading, false)
-      } catch (e: any) {
-        console.error('Init error:', e)
-        safeSetState(setError, e.message === 'SESSION_TIMEOUT'
-          ? "Timeout session. Rafraîchis la page (ou Hard Reset)."
-          : "Erreur d'initialisation. Essaie Hard Reset."
-        )
-        safeSetState(setLoading, false)
-      }
+    const { data: sub } = supabase.auth.onAuthStateChange((_event, session) => {
+      const nextUser = session?.user ?? null
+      setUser(nextUser)
+    })
+    return () => {
+      sub.subscription.unsubscribe()
     }
+  }, [setUser])
 
+  // Init unique au montage
+  useEffect(() => {
     init()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  /** ========= Reload tasks quand filtre change ========= */
+  // Reload tasks quand filtres changent (si on a un household id fiable)
   useEffect(() => {
-    if (!householdId || loading || error) return
-    loadTasksForHousehold(householdId)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [filter, selectedMemberFilter, householdId])
+    const hId = householdId || (() => {
+      try {
+        return localStorage.getItem(LS_HOUSEHOLD_ID_KEY)
+      } catch {
+        return null
+      }
+    })()
 
-  const loadInitialData = async (userId: string) => {
-    try {
-      setError(null)
+    if (!hId) return
+    if (loading) return
+    if (error) return
 
-      // member + household
-      const memberRes = await withTimeout(
-        supabase
-          .from('members')
-          .select('household_id, households(id, name)')
-          .eq('id', userId)
-          .single(),
-        8000,
-        'INIT_TIMEOUT'
-      )
-
-      if (memberRes.error) throw memberRes.error
-      if (!memberRes.data) throw new Error('No member data')
-
-      const householdData = memberRes.data.households as any
-      const hId = householdData?.id as string | undefined
-      if (!hId) throw new Error('Household introuvable')
-
-      safeSetState(setHousehold, { id: hId, name: householdData.name })
-      safeSetState(setHouseholdId, hId)
-      localStorage.setItem(STORAGE_KEY, hId)
-
-      // members list
-      const membersRes = await withTimeout(
-        supabase.from('members').select('id, display_name').eq('household_id', memberRes.data.household_id),
-        8000,
-        'MEMBERS_TIMEOUT'
-      )
-      if (membersRes.error) throw membersRes.error
-      safeSetState(setMembers, membersRes.data || [])
-
-      await loadTasksForHousehold(hId)
-    } catch (e: any) {
-      console.error('loadInitialData error:', e)
-      localStorage.removeItem(STORAGE_KEY)
-      throw e
-    }
-  }
-
-  const loadTasksForHousehold = async (hId: string) => {
-    try {
-      let query = supabase
-        .from('tasks')
-        .select('*, members:assigned_to(display_name)')
-        .eq('household_id', hId)
-        .order('created_at', { ascending: false })
-
-      if (filter === 'pending') query = query.in('status', ['pending', 'in_progress'])
-      if (filter === 'completed') query = query.eq('status', 'completed')
-      if (selectedMemberFilter) query = query.eq('assigned_to', selectedMemberFilter)
-
-      const res = await withTimeout(query, 8000, 'TASKS_TIMEOUT')
-      // @ts-ignore
-      if (res.error) throw res.error
-      // @ts-ignore
-      safeSetState(setTasks, res.data || [])
-    } catch (e: any) {
-      console.error('loadTasksForHousehold error:', e)
-      safeSetState(setError, e.message === 'TASKS_TIMEOUT'
-        ? "Timeout chargement tâches. Réessaie, ou Hard Reset."
-        : "Erreur chargement tâches. Réessaie, ou Hard Reset."
-      )
-    }
-  }
-
-  const handleLogout = async () => {
-    localStorage.removeItem(STORAGE_KEY)
-    await supabase.auth.signOut()
-    setUser(null)
-    navigate('/login')
-  }
-
-  const resetForm = () => {
-    setFormData({
-      title: '',
-      description: '',
-      category: 'general',
-      assigned_to: '',
-      due_date: '',
-      points: 10,
+    loadTasksForHousehold(hId).catch((e) => {
+      console.error('[Tasks:filters] reload error', e)
+      // on ne bloque pas l’UI, mais on peut afficher une erreur légère
     })
-  }
+  }, [filter, selectedMemberFilter, householdId, loading, error, loadTasksForHousehold])
 
   const handleCreateTask = async (e: React.FormEvent) => {
     e.preventDefault()
     if (isSubmitting) return
 
+    safeSet(setIsSubmitting, true)
+
     try {
-      setIsSubmitting(true)
+      const userRes = await withTimeout(supabase.auth.getUser(), 8000, 'GETUSER_TIMEOUT')
+      const currentUser = userRes.data.user
+      if (!currentUser) {
+        await logout()
+        return
+      }
 
-      const sessionUser = user ?? (await supabase.auth.getUser()).data.user
-      if (!sessionUser) throw new Error('Utilisateur non connecté')
+      const hId =
+        householdId ||
+        (() => {
+          try {
+            return localStorage.getItem(LS_HOUSEHOLD_ID_KEY)
+          } catch {
+            return null
+          }
+        })()
 
-      const hId = householdId || localStorage.getItem(STORAGE_KEY)
-      if (!hId) throw new Error('Famille introuvable. Hard Reset conseillé.')
+      if (!hId) throw Object.assign(new Error('Famille introuvable. Réessaye.'), { code: 'NO_HOUSEHOLD' })
 
       const payload = {
         household_id: hId,
@@ -281,92 +350,127 @@ export default function Tasks() {
         description: formData.description?.trim() ? formData.description.trim() : null,
         category: formData.category,
         assigned_to: formData.assigned_to || null,
-        created_by: sessionUser.id,
+        created_by: currentUser.id,
         points: Number.isFinite(formData.points) ? formData.points : 10,
         due_date: formData.due_date || null,
         status: 'pending' as const,
       }
 
-      // IMPORTANT: select() pour récupérer la ligne insérée => affichage immédiat
-      const insertRes = await withTimeout(
-        supabase
-          .from('tasks')
-          .insert(payload)
-          .select('*, members:assigned_to(display_name)')
-          .single(),
-        8000,
-        'INSERT_TIMEOUT'
-      )
+      // Insert + return row join
+      const insertQuery = supabase
+        .from('tasks')
+        .insert(payload)
+        .select('*, members:assigned_to(display_name)')
+        .single()
 
-      if (insertRes.error) throw insertRes.error
-      if (!insertRes.data) throw new Error('Insertion OK mais aucune donnée retournée')
+      const { data: inserted, error: insErr } = await withTimeout(insertQuery, 12000, 'INSERT_TIMEOUT')
+      if (insErr) throw insErr
 
-      // UI: on ajoute direct en haut
-      safeSetState(setTasks, (current: any) => [insertRes.data, ...(current || [])])
+      // reset form
+      safeSet(setFormData, {
+        title: '',
+        description: '',
+        category: 'general',
+        assigned_to: '',
+        due_date: '',
+        points: 10,
+      })
 
-      resetForm()
-      safeSetState(setShowModal, false)
-    } catch (e: any) {
-      console.error('handleCreateTask error:', e)
-      const msg =
-        e.message === 'INSERT_TIMEOUT'
-          ? 'Timeout insertion. Ta tâche est peut-être créée (recharge la liste).'
-          : e.message || 'Erreur création tâche'
+      // Ferme modal vite, puis refresh (le refresh respecte les filtres)
+      safeSet(setShowModal, false)
 
-      // On ne bloque pas l’UI avec un confirm qui peut provoquer des comportements bizarres
-      safeSetState(setError, msg)
+      // Pour éviter “ça n’apparaît pas”, on fait :
+      // 1) update optimiste SI le filtre permet de voir la tâche
+      const canShowInCurrentView =
+        filter === 'all' ||
+        (filter === 'pending' && (inserted as Task).status !== 'completed') ||
+        (filter === 'completed' && (inserted as Task).status === 'completed')
+
+      if (canShowInCurrentView) {
+        safeSet(setTasks, (current) => [inserted as any, ...(current || [])])
+      }
+
+      // 2) refresh serveur (source de vérité)
+      await loadTasksForHousehold(hId)
+    } catch (err: any) {
+      console.error('[Tasks:create] error', err)
+
+      const code = err?.code || err?.message
+      const isNetworkish =
+        code === 'INSERT_TIMEOUT' ||
+        String(err?.message || '').toLowerCase().includes('fetch') ||
+        String(err?.message || '').toLowerCase().includes('network')
+
+      if (isNetworkish) {
+        const ok = confirm('Connexion instable. Voulez-vous Réessayer ? (Annuler = Hard Reset)')
+        if (ok) {
+          // on retente une fois via init (re-sync complet)
+          retry()
+        } else {
+          hardReset()
+        }
+      } else {
+        alert(err?.message || 'Erreur lors de la création')
+      }
     } finally {
-      safeSetState(setIsSubmitting, false)
+      safeSet(setIsSubmitting, false)
     }
   }
 
   const handleToggleComplete = async (task: Task) => {
-    const newStatus = task.status === 'completed' ? 'pending' : 'completed'
+    const newStatus: Task['status'] = task.status === 'completed' ? 'pending' : 'completed'
     const completedAt = newStatus === 'completed' ? new Date().toISOString() : null
 
-    // Optimistic UI
-    setTasks((current) => current.map((t) => (t.id === task.id ? { ...t, status: newStatus, completed_at: completedAt } : t)))
+    // Optimiste
+    safeSet(setTasks, (current) => current.map((t) => (t.id === task.id ? { ...t, status: newStatus, completed_at: completedAt } : t)))
 
-    const { error } = await supabase
+    const updateQuery = supabase
       .from('tasks')
       .update({ status: newStatus, completed_at: completedAt })
       .eq('id', task.id)
 
-    if (error) {
-      console.error('toggle error:', error)
-      // rollback via reload
-      const hId = householdId || localStorage.getItem(STORAGE_KEY)
-      if (hId) loadTasksForHousehold(hId)
-    } else {
-      // si filtre != all, on recharge pour éviter incohérences
-      if (filter !== 'all') {
-        const hId = householdId || localStorage.getItem(STORAGE_KEY)
-        if (hId) loadTasksForHousehold(hId)
-      }
+    const { error: upErr } = await withTimeout(updateQuery, 12000, 'UPDATE_TIMEOUT')
+    if (upErr) {
+      // rollback par reload
+      const hId = householdId || (localStorage.getItem(LS_HOUSEHOLD_ID_KEY) ?? '')
+      if (hId) loadTasksForHousehold(hId).catch(() => {})
+      return
+    }
+
+    // Si filtre courant exclut la tâche, refresh
+    if (filter !== 'all') {
+      const hId = householdId || (localStorage.getItem(LS_HOUSEHOLD_ID_KEY) ?? '')
+      if (hId) loadTasksForHousehold(hId).catch(() => {})
     }
   }
 
   const handleDeleteTask = async (taskId: string) => {
     if (!confirm('Supprimer cette tâche ?')) return
 
-    // Optimistic remove
-    setTasks((current) => current.filter((t) => t.id !== taskId))
+    // Optimiste
+    const prev = tasks
+    safeSet(setTasks, (current) => current.filter((t) => t.id !== taskId))
 
-    const { error } = await supabase.from('tasks').delete().eq('id', taskId)
-    if (error) {
-      console.error('delete error:', error)
-      const hId = householdId || localStorage.getItem(STORAGE_KEY)
-      if (hId) loadTasksForHousehold(hId)
+    try {
+      const delQuery = supabase.from('tasks').delete().eq('id', taskId)
+      const { error: delErr } = await withTimeout(delQuery, 12000, 'DELETE_TIMEOUT')
+      if (delErr) throw delErr
+    } catch (e) {
+      console.error('[Tasks:delete] error', e)
+      // rollback
+      safeSet(setTasks, prev)
     }
   }
 
-  /** ========= UI states ========= */
+  // ------------------ UI ------------------
+
   if (loading) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-gray-50">
         <div className="text-center">
           <Loader2 className="h-12 w-12 animate-spin text-blue-600 mx-auto" />
           <p className="mt-4 text-lg font-medium text-gray-700">Chargement de HomeFlow...</p>
+          <p className="mt-2 text-sm text-gray-400">Si ça dure trop, rafraîchis la page.</p>
         </div>
       </div>
     )
@@ -376,38 +480,48 @@ export default function Tasks() {
     return (
       <div className="min-h-screen flex items-center justify-center bg-gray-50 px-4">
         <div className="text-center max-w-md w-full bg-white p-8 rounded-2xl shadow-lg border border-red-100">
-          <WifiOff className="h-16 w-16 text-red-500 mx-auto mb-4" />
+          <div className="flex justify-center mb-4">
+            <div className="w-16 h-16 rounded-full bg-red-50 flex items-center justify-center">
+              <WifiOff className="h-8 w-8 text-red-500" />
+            </div>
+          </div>
+
           <h2 className="text-xl font-bold text-gray-900 mb-2">Problème de synchronisation</h2>
           <p className="text-gray-600 mb-6">{error}</p>
 
-          <div className="flex gap-3">
+          <div className="space-y-3">
             <button
-              onClick={() => {
-                setError(null)
-                const hId = householdId || localStorage.getItem(STORAGE_KEY)
-                if (hId) loadTasksForHousehold(hId)
-              }}
-              className="flex-1 py-3 bg-gray-900 text-white rounded-xl hover:bg-black transition font-medium shadow-md"
+              onClick={retry}
+              className="w-full py-3 bg-blue-600 text-white rounded-xl hover:bg-blue-700 transition font-medium shadow-md flex items-center justify-center gap-2"
             >
+              <RefreshCw className="w-5 h-5" />
               Réessayer
             </button>
 
             <button
               onClick={hardReset}
-              className="flex-1 py-3 bg-blue-600 text-white rounded-xl hover:bg-blue-700 transition font-medium shadow-md flex items-center justify-center gap-2"
+              className="w-full py-3 border border-gray-300 text-gray-700 rounded-xl hover:bg-gray-50 transition font-medium flex items-center justify-center gap-2"
             >
-              <RefreshCw className="w-5 h-5" />
-              Hard Reset
+              <AlertTriangle className="w-5 h-5" />
+              Hard Reset (vider cache)
+            </button>
+
+            <button
+              onClick={logout}
+              className="w-full py-3 border border-gray-200 text-gray-500 rounded-xl hover:bg-gray-50 transition font-medium"
+            >
+              Se déconnecter
             </button>
           </div>
 
-          <p className="text-xs text-gray-400 mt-4">Le Hard Reset supprime le cache local “household_id” et recharge proprement.</p>
+          <p className="text-xs text-gray-400 mt-4">
+            Astuce : si tu as changé d’onglet longtemps, la session peut expirer. « Réessayer » suffit souvent.
+          </p>
         </div>
       </div>
     )
   }
 
-  /** ========= Page ========= */
   return (
     <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-50">
       <nav className="bg-white shadow-sm border-b">
@@ -423,13 +537,24 @@ export default function Tasks() {
               </button>
             </div>
 
-            <button
-              onClick={handleLogout}
-              className="flex items-center px-4 py-2 text-sm text-gray-700 hover:text-gray-900 hover:bg-gray-100 rounded-lg transition"
-            >
-              <LogOut className="w-4 h-4 mr-2" />
-              Déconnexion
-            </button>
+            <div className="flex items-center gap-3">
+              <button
+                onClick={retry}
+                className="hidden sm:flex items-center px-3 py-2 text-sm text-gray-700 hover:bg-gray-100 rounded-lg transition"
+                title="Rafraîchir"
+              >
+                <RefreshCw className="w-4 h-4 mr-2" />
+                Sync
+              </button>
+
+              <button
+                onClick={logout}
+                className="flex items-center px-4 py-2 text-sm text-gray-700 hover:text-gray-900 hover:bg-gray-100 rounded-lg transition"
+              >
+                <LogOut className="w-4 h-4 mr-2" />
+                Déconnexion
+              </button>
+            </div>
           </div>
         </div>
       </nav>
@@ -547,7 +672,7 @@ export default function Tasks() {
 
                         <div className="flex flex-wrap gap-2 items-center">
                           <span className={`px-3 py-1 rounded-full text-xs font-medium ${getCategoryStyle(task.category)}`}>
-                            {CATEGORIES.find((c) => c.value === task.category)?.label}
+                            {CATEGORIES.find((c) => c.value === task.category)?.label || 'Général'}
                           </span>
 
                           {task.members?.display_name && (
@@ -568,13 +693,15 @@ export default function Tasks() {
                         </div>
                       </div>
 
-                      <button
-                        onClick={() => handleDeleteTask(task.id)}
-                        className="p-2 text-red-600 hover:bg-red-50 rounded-lg transition"
-                        title="Supprimer"
-                      >
-                        <Trash2 className="w-5 h-5" />
-                      </button>
+                      <div className="flex gap-2">
+                        <button
+                          onClick={() => handleDeleteTask(task.id)}
+                          className="p-2 text-red-600 hover:bg-red-50 rounded-lg transition"
+                          title="Supprimer"
+                        >
+                          <Trash2 className="w-5 h-5" />
+                        </button>
+                      </div>
                     </div>
                   </div>
                 </div>
@@ -590,6 +717,7 @@ export default function Tasks() {
           <div className="bg-white rounded-2xl shadow-2xl max-w-2xl w-full max-h-[90vh] overflow-y-auto">
             <div className="sticky top-0 bg-white border-b px-6 py-4 flex justify-between items-center">
               <h3 className="text-2xl font-bold text-gray-900">Créer une tâche</h3>
+
               <button
                 onClick={() => setShowModal(false)}
                 className="p-2 hover:bg-gray-100 rounded-lg transition"
@@ -605,7 +733,7 @@ export default function Tasks() {
                 <input
                   type="text"
                   value={formData.title}
-                  onChange={(e) => setFormData((p) => ({ ...p, title: e.target.value }))}
+                  onChange={(e) => setFormData({ ...formData, title: e.target.value })}
                   placeholder="Ex: Faire les courses"
                   className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
                   required
@@ -617,7 +745,7 @@ export default function Tasks() {
                 <label className="block text-sm font-medium text-gray-700 mb-2">Description</label>
                 <textarea
                   value={formData.description}
-                  onChange={(e) => setFormData((p) => ({ ...p, description: e.target.value }))}
+                  onChange={(e) => setFormData({ ...formData, description: e.target.value })}
                   placeholder="Détails de la tâche..."
                   rows={3}
                   className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
@@ -630,7 +758,7 @@ export default function Tasks() {
                   <label className="block text-sm font-medium text-gray-700 mb-2">Catégorie</label>
                   <select
                     value={formData.category}
-                    onChange={(e) => setFormData((p) => ({ ...p, category: e.target.value }))}
+                    onChange={(e) => setFormData({ ...formData, category: e.target.value })}
                     className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
                     disabled={isSubmitting}
                   >
@@ -646,7 +774,7 @@ export default function Tasks() {
                   <label className="block text-sm font-medium text-gray-700 mb-2">Assigner à</label>
                   <select
                     value={formData.assigned_to}
-                    onChange={(e) => setFormData((p) => ({ ...p, assigned_to: e.target.value }))}
+                    onChange={(e) => setFormData({ ...formData, assigned_to: e.target.value })}
                     className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
                     disabled={isSubmitting}
                   >
@@ -666,7 +794,7 @@ export default function Tasks() {
                   <input
                     type="date"
                     value={formData.due_date}
-                    onChange={(e) => setFormData((p) => ({ ...p, due_date: e.target.value }))}
+                    onChange={(e) => setFormData({ ...formData, due_date: e.target.value })}
                     className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
                     disabled={isSubmitting}
                   />
@@ -677,7 +805,7 @@ export default function Tasks() {
                   <input
                     type="number"
                     value={formData.points}
-                    onChange={(e) => setFormData((p) => ({ ...p, points: parseInt(e.target.value || '10', 10) }))}
+                    onChange={(e) => setFormData({ ...formData, points: parseInt(e.target.value || '0', 10) })}
                     min={1}
                     max={100}
                     className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
@@ -689,10 +817,7 @@ export default function Tasks() {
               <div className="flex gap-3 pt-4">
                 <button
                   type="button"
-                  onClick={() => {
-                    setShowModal(false)
-                    resetForm()
-                  }}
+                  onClick={() => setShowModal(false)}
                   className="flex-1 px-6 py-3 border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50 transition font-medium"
                   disabled={isSubmitting}
                 >
@@ -714,6 +839,10 @@ export default function Tasks() {
                   )}
                 </button>
               </div>
+
+              <p className="text-xs text-gray-400">
+                Si tu reviens après avoir changé d’onglet et que ça bloque, clique « Sync » (en haut) ou « Réessayer ».
+              </p>
             </form>
           </div>
         </div>
