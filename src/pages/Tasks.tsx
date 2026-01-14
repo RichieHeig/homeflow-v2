@@ -163,7 +163,7 @@ export default function Tasks() {
 
       if (selectedMemberFilter) query = query.eq('assigned_to', selectedMemberFilter)
 
-      const result = await withTimeout(query, 12000, 'TASKS_TIMEOUT') as { data: Task[] | null; error: any }
+      const result = await withTimeout(query, 20000, 'TASKS_TIMEOUT') as { data: Task[] | null; error: any }
       const { data, error: qErr } = result
       if (qErr) throw qErr
 
@@ -180,7 +180,7 @@ export default function Tasks() {
         .eq('id', userId)
         .single()
 
-      const memberResult = await withTimeout(memberQuery, 12000, 'MEMBER_TIMEOUT') as { 
+      const memberResult = await withTimeout(memberQuery, 20000, 'MEMBER_TIMEOUT') as { 
         data: { household_id: string; households: any } | null; 
         error: any 
       }
@@ -206,7 +206,7 @@ export default function Tasks() {
         .select('id, display_name')
         .eq('household_id', memberData.household_id)
 
-      const membersResult = await withTimeout(membersQuery, 12000, 'MEMBERS_TIMEOUT') as {
+      const membersResult = await withTimeout(membersQuery, 20000, 'MEMBERS_TIMEOUT') as {
         data: Member[] | null;
         error: any
       }
@@ -346,6 +346,22 @@ export default function Tasks() {
 
       if (!hId) throw Object.assign(new Error('Famille introuvable. Réessaye.'), { code: 'NO_HOUSEHOLD' })
 
+      // ✅ Vérifier la connexion avec un ping rapide
+      try {
+        await withTimeout(
+          supabase.from('tasks').select('id').limit(1), 
+          3000, 
+          'PING_TIMEOUT'
+        )
+      } catch (pingErr: any) {
+        if (pingErr.code === 'PING_TIMEOUT') {
+          throw Object.assign(
+            new Error('Connexion lente ou interrompue. Clique « Sync » en haut puis réessaye.'),
+            { code: 'CONNECTION_LOST' }
+          )
+        }
+      }
+
       const payload = {
         household_id: hId,
         title: formData.title.trim(),
@@ -364,7 +380,7 @@ export default function Tasks() {
         .select('*, members:assigned_to(display_name)')
         .single()
 
-      const insertResult = await withTimeout(insertQuery, 12000, 'INSERT_TIMEOUT') as {
+      const insertResult = await withTimeout(insertQuery, 20000, 'INSERT_TIMEOUT') as {
         data: Task | null;
         error: any;
       }
@@ -408,12 +424,19 @@ export default function Tasks() {
       console.error('[Tasks:create] error', err)
 
       const code = err?.code || err?.message
+      const isTimeout = code === 'INSERT_TIMEOUT' || code === 'CONNECTION_LOST'
       const isNetworkish =
-        code === 'INSERT_TIMEOUT' ||
+        isTimeout ||
         String(err?.message || '').toLowerCase().includes('fetch') ||
         String(err?.message || '').toLowerCase().includes('network')
 
-      if (isNetworkish) {
+      if (isTimeout) {
+        alert(
+          'La création a échoué car la connexion était trop lente.\n\n' +
+          '✅ Solution : Clique sur « Sync » en haut, puis réessaye.\n\n' +
+          'Si le problème persiste, rafraîchis la page.'
+        )
+      } else if (isNetworkish) {
         const ok = confirm('Connexion instable. Voulez-vous Réessayer ? (Annuler = Hard Reset)')
         if (ok) {
           retry()
@@ -443,7 +466,7 @@ export default function Tasks() {
         .update({ status: newStatus, completed_at: completedAt })
         .eq('id', task.id)
 
-      const updateResult = await withTimeout(updateQuery, 12000, 'UPDATE_TIMEOUT') as {
+      const updateResult = await withTimeout(updateQuery, 20000, 'UPDATE_TIMEOUT') as {
         data: any;
         error: any;
       }
@@ -476,7 +499,7 @@ export default function Tasks() {
 
     try {
       const delQuery = supabase.from('tasks').delete().eq('id', taskId)
-      const deleteResult = await withTimeout(delQuery, 12000, 'DELETE_TIMEOUT') as {
+      const deleteResult = await withTimeout(delQuery, 20000, 'DELETE_TIMEOUT') as {
         data: any;
         error: any;
       }
