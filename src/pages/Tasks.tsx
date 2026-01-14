@@ -1,4 +1,4 @@
-import { useEffect, useState, useRef } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { supabase } from '@/lib/supabase'
 import { useAuthStore } from '@/store/authStore'
@@ -18,6 +18,7 @@ import {
   RefreshCw,
 } from 'lucide-react'
 
+/** ========= Types ========= */
 interface Task {
   id: string
   title: string
@@ -30,9 +31,10 @@ interface Task {
   due_date: string | null
   completed_at: string | null
   created_at: string
+  household_id: string
   members?: {
     display_name: string
-  }
+  } | null
 }
 
 interface Member {
@@ -45,6 +47,9 @@ interface Household {
   name: string
 }
 
+/** ========= Const ========= */
+const STORAGE_KEY = 'homeflow_household_id'
+
 const CATEGORIES = [
   { value: 'general', label: 'Général', color: 'bg-gray-100 text-gray-700' },
   { value: 'cuisine', label: 'Cuisine', color: 'bg-orange-100 text-orange-700' },
@@ -55,6 +60,15 @@ const CATEGORIES = [
   { value: 'administratif', label: 'Administratif', color: 'bg-purple-100 text-purple-700' },
   { value: 'autre', label: 'Autre', color: 'bg-pink-100 text-pink-700' },
 ]
+
+/** ========= Helpers ========= */
+function withTimeout<T>(promise: Promise<T>, ms: number, label = 'TIMEOUT') {
+  let timer: any
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(label)), ms)
+  })
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer)) as Promise<T>
+}
 
 export default function Tasks() {
   const navigate = useNavigate()
@@ -67,12 +81,15 @@ export default function Tasks() {
 
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+
   const [showModal, setShowModal] = useState(false)
   const [isSubmitting, setIsSubmitting] = useState(false)
+
   const [filter, setFilter] = useState<'all' | 'pending' | 'completed'>('pending')
   const [selectedMemberFilter, setSelectedMemberFilter] = useState<string | null>(null)
 
-  const hasLoadedData = useRef(false)
+  const mountedRef = useRef(true)
+  const didInitRef = useRef(false)
 
   const [formData, setFormData] = useState({
     title: '',
@@ -83,250 +100,267 @@ export default function Tasks() {
     points: 10,
   })
 
-  // ✅ FIX PRO : Hydrate la session Supabase au mount (évite le spinner infini après refresh)
   useEffect(() => {
-    let mounted = true
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
+    }
+  }, [])
 
-    const initAuth = async () => {
+  const safeSetState = <T,>(setter: (v: T) => void, value: T) => {
+    if (mountedRef.current) setter(value)
+  }
+
+  const getCategoryStyle = (category: string) =>
+    CATEGORIES.find((c) => c.value === category)?.color || CATEGORIES[0].color
+
+  const pendingCount = useMemo(() => tasks.filter((t) => t.status !== 'completed').length, [tasks])
+  const completedCount = useMemo(() => tasks.filter((t) => t.status === 'completed').length, [tasks])
+
+  const hardReset = () => {
+    console.log('🧹 Hard reset (cache household + reload)')
+    localStorage.removeItem(STORAGE_KEY)
+    window.location.reload()
+  }
+
+  /** ========= Auth/session guard =========
+   * Important en prod : parfois ton store a user=null au premier render.
+   * On tente de récupérer la session Supabase pour éviter le "loading infini".
+   */
+  useEffect(() => {
+    if (didInitRef.current) return
+    didInitRef.current = true
+
+    const init = async () => {
       try {
-        const { data, error } = await supabase.auth.getUser()
+        setLoading(true)
+        setError(null)
 
-        if (!mounted) return
+        // 1) Si le store n’a pas encore user, on tente getSession()
+        if (!user) {
+          const { data } = awaitẮ withTimeout(supabase.auth.getSession(), 8000, 'SESSION_TIMEOUT')
+          const sessionUser = data.session?.user ?? null
+          if (sessionUser) setUser(sessionUser)
+        }
 
-        if (error || !data?.user) {
-          setUser(null)
+        // 2) Si toujours pas user => go login (pas de spinner infini)
+        const currentUser = user ?? (await supabase.auth.getUser()).data.user
+        if (!currentUser) {
           setLoading(false)
           navigate('/login')
           return
         }
 
-        // hydrate le store
-        setUser(data.user)
-      } catch {
-        if (!mounted) return
-        setUser(null)
-        setLoading(false)
-        navigate('/login')
+        // 3) Charger données
+        await loadInitialData(currentUser.id)
+        safeSetState(setLoading, false)
+      } catch (e: any) {
+        console.error('Init error:', e)
+        safeSetState(setError, e.message === 'SESSION_TIMEOUT'
+          ? "Timeout session. Rafraîchis la page (ou Hard Reset)."
+          : "Erreur d'initialisation. Essaie Hard Reset."
+        )
+        safeSetState(setLoading, false)
       }
     }
 
-    initAuth()
-
-    const { data: sub } = supabase.auth.onAuthStateChange((_event, session) => {
-      if (!mounted) return
-      setUser(session?.user ?? null)
-      if (!session?.user) {
-        setLoading(false)
-        navigate('/login')
-      }
-    })
-
-    return () => {
-      mounted = false
-      sub?.subscription?.unsubscribe()
-    }
-  }, [navigate, setUser])
-
-  // Fonction pour faire un "Hard Reset" quand ça plante
-  const handleHardRefresh = () => {
-    console.log('🧹 Nettoyage du cache et rechargement...')
-    localStorage.removeItem('homeflow_household_id')
-    window.location.reload()
-  }
-
-  // ✅ Quand user est prêt, on charge les données 1 seule fois
-  useEffect(() => {
-    if (!hasLoadedData.current && user) {
-      hasLoadedData.current = true
-      loadInitialData()
-    }
-  }, [user])
-
-  // Rechargement quand filtres changent (uniquement après init)
-  useEffect(() => {
-    const safeHouseholdId = householdId || localStorage.getItem('homeflow_household_id')
-    if (hasLoadedData.current && safeHouseholdId && !loading && !error) {
-      loadTasksForHousehold(safeHouseholdId)
-    }
+    init()
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [filter, selectedMemberFilter])
+  }, [])
 
-  const loadInitialData = async () => {
-    if (!user) {
-      setLoading(false)
-      navigate('/login')
-      return
-    }
+  /** ========= Reload tasks quand filtre change ========= */
+  useEffect(() => {
+    if (!householdId || loading || error) return
+    loadTasksForHousehold(householdId)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filter, selectedMemberFilter, householdId])
 
+  const loadInitialData = async (userId: string) => {
     try {
-      const fetchDataPromise = async () => {
-        const { data: memberData, error: memberError } = await supabase
+      setError(null)
+
+      // member + household
+      const memberRes = await withTimeout(
+        supabase
           .from('members')
           .select('household_id, households(id, name)')
-          .eq('id', user.id)
-          .single()
-
-        if (memberError || !memberData) throw memberError || new Error('No member data')
-
-        const householdData = memberData.households as any
-        const hId = householdData.id
-
-        setHousehold({ id: hId, name: householdData.name })
-        setHouseholdId(hId)
-
-        localStorage.setItem('homeflow_household_id', hId)
-
-        const { data: membersData, error: membersError } = await supabase
-          .from('members')
-          .select('id, display_name')
-          .eq('household_id', memberData.household_id)
-
-        if (membersError) throw membersError
-        setMembers(membersData || [])
-
-        await loadTasksForHousehold(hId)
-      }
-
-      const timeoutPromise = new Promise((_, reject) =>
-        setTimeout(() => reject(new Error('TIMEOUT_STARTUP')), 10000)
+          .eq('id', userId)
+          .single(),
+        8000,
+        'INIT_TIMEOUT'
       )
 
-      await Promise.race([fetchDataPromise(), timeoutPromise])
-      setError(null)
-    } catch (error: any) {
-      console.error('Erreur chargement initial:', error)
-      localStorage.removeItem('homeflow_household_id')
+      if (memberRes.error) throw memberRes.error
+      if (!memberRes.data) throw new Error('No member data')
 
-      if (error?.message === 'TIMEOUT_STARTUP') {
-        setError('La connexion est lente. Nous avons nettoyé le cache, réessayez.')
-      } else {
-        setError('Erreur de chargement. Le cache a été nettoyé.')
-      }
-    } finally {
-      setLoading(false)
+      const householdData = memberRes.data.households as any
+      const hId = householdData?.id as string | undefined
+      if (!hId) throw new Error('Household introuvable')
+
+      safeSetState(setHousehold, { id: hId, name: householdData.name })
+      safeSetState(setHouseholdId, hId)
+      localStorage.setItem(STORAGE_KEY, hId)
+
+      // members list
+      const membersRes = await withTimeout(
+        supabase.from('members').select('id, display_name').eq('household_id', memberRes.data.household_id),
+        8000,
+        'MEMBERS_TIMEOUT'
+      )
+      if (membersRes.error) throw membersRes.error
+      safeSetState(setMembers, membersRes.data || [])
+
+      await loadTasksForHousehold(hId)
+    } catch (e: any) {
+      console.error('loadInitialData error:', e)
+      localStorage.removeItem(STORAGE_KEY)
+      throw e
     }
   }
 
-  const loadTasksForHousehold = async (targetHouseholdId: string) => {
+  const loadTasksForHousehold = async (hId: string) => {
     try {
       let query = supabase
         .from('tasks')
-        .select(`*, members:assigned_to(display_name)`)
-        .eq('household_id', targetHouseholdId)
+        .select('*, members:assigned_to(display_name)')
+        .eq('household_id', hId)
         .order('created_at', { ascending: false })
 
       if (filter === 'pending') query = query.in('status', ['pending', 'in_progress'])
-      else if (filter === 'completed') query = query.eq('status', 'completed')
+      if (filter === 'completed') query = query.eq('status', 'completed')
       if (selectedMemberFilter) query = query.eq('assigned_to', selectedMemberFilter)
 
-      const { data: tasksData, error } = await query
-      if (error) throw error
-
-      setTasks(tasksData || [])
-    } catch (error) {
-      console.error('Erreur chargement tâches:', error)
+      const res = await withTimeout(query, 8000, 'TASKS_TIMEOUT')
+      // @ts-ignore
+      if (res.error) throw res.error
+      // @ts-ignore
+      safeSetState(setTasks, res.data || [])
+    } catch (e: any) {
+      console.error('loadTasksForHousehold error:', e)
+      safeSetState(setError, e.message === 'TASKS_TIMEOUT'
+        ? "Timeout chargement tâches. Réessaie, ou Hard Reset."
+        : "Erreur chargement tâches. Réessaie, ou Hard Reset."
+      )
     }
   }
 
-  const reloadTasks = async () => {
-    const hId = householdId || localStorage.getItem('homeflow_household_id')
-    if (hId) await loadTasksForHousehold(hId)
-  }
-
   const handleLogout = async () => {
-    localStorage.removeItem('homeflow_household_id')
+    localStorage.removeItem(STORAGE_KEY)
     await supabase.auth.signOut()
     setUser(null)
     navigate('/login')
   }
 
+  const resetForm = () => {
+    setFormData({
+      title: '',
+      description: '',
+      category: 'general',
+      assigned_to: '',
+      due_date: '',
+      points: 10,
+    })
+  }
+
   const handleCreateTask = async (e: React.FormEvent) => {
     e.preventDefault()
     if (isSubmitting) return
-    setIsSubmitting(true)
 
     try {
-      if (!user) throw new Error('Utilisateur non connecté')
-      const hId = householdId || localStorage.getItem('homeflow_household_id')
-      if (!hId) throw new Error('Famille introuvable. Veuillez rafraîchir.')
+      setIsSubmitting(true)
 
-      const insertPromise = supabase.from('tasks').insert({
+      const sessionUser = user ?? (await supabase.auth.getUser()).data.user
+      if (!sessionUser) throw new Error('Utilisateur non connecté')
+
+      const hId = householdId || localStorage.getItem(STORAGE_KEY)
+      if (!hId) throw new Error('Famille introuvable. Hard Reset conseillé.')
+
+      const payload = {
         household_id: hId,
-        title: formData.title,
-        description: formData.description || null,
+        title: formData.title.trim(),
+        description: formData.description?.trim() ? formData.description.trim() : null,
         category: formData.category,
         assigned_to: formData.assigned_to || null,
-        created_by: user.id,
-        points: formData.points,
+        created_by: sessionUser.id,
+        points: Number.isFinite(formData.points) ? formData.points : 10,
         due_date: formData.due_date || null,
-        status: 'pending',
-      })
+        status: 'pending' as const,
+      }
 
-      const timeoutPromise = new Promise((_, reject) =>
-        setTimeout(() => reject(new Error('TIMEOUT_ERROR')), 5000)
+      // IMPORTANT: select() pour récupérer la ligne insérée => affichage immédiat
+      const insertRes = await withTimeout(
+        supabase
+          .from('tasks')
+          .insert(payload)
+          .select('*, members:assigned_to(display_name)')
+          .single(),
+        8000,
+        'INSERT_TIMEOUT'
       )
 
-      // @ts-ignore
-      const result: any = await Promise.race([insertPromise, timeoutPromise])
-      if (result.error) throw result.error
+      if (insertRes.error) throw insertRes.error
+      if (!insertRes.data) throw new Error('Insertion OK mais aucune donnée retournée')
 
-      setFormData({
-        title: '',
-        description: '',
-        category: 'general',
-        assigned_to: '',
-        due_date: '',
-        points: 10,
-      })
+      // UI: on ajoute direct en haut
+      safeSetState(setTasks, (current: any) => [insertRes.data, ...(current || [])])
 
-      await loadTasksForHousehold(hId)
-      setShowModal(false)
-    } catch (err: any) {
-      console.error('Erreur création:', err)
-      if (err.message === 'TIMEOUT_ERROR' || err.message?.includes('fetch')) {
-        if (confirm('Connexion perdue. Voulez-vous nettoyer le cache et recharger ?')) {
-          handleHardRefresh()
-        }
-      } else {
-        alert(err.message || 'Erreur inconnue')
-      }
+      resetForm()
+      safeSetState(setShowModal, false)
+    } catch (e: any) {
+      console.error('handleCreateTask error:', e)
+      const msg =
+        e.message === 'INSERT_TIMEOUT'
+          ? 'Timeout insertion. Ta tâche est peut-être créée (recharge la liste).'
+          : e.message || 'Erreur création tâche'
+
+      // On ne bloque pas l’UI avec un confirm qui peut provoquer des comportements bizarres
+      safeSetState(setError, msg)
     } finally {
-      setIsSubmitting(false)
+      safeSetState(setIsSubmitting, false)
     }
   }
 
   const handleToggleComplete = async (task: Task) => {
     const newStatus = task.status === 'completed' ? 'pending' : 'completed'
-    setTasks((current) => current.map((t) => (t.id === task.id ? { ...t, status: newStatus } : t)))
     const completedAt = newStatus === 'completed' ? new Date().toISOString() : null
+
+    // Optimistic UI
+    setTasks((current) => current.map((t) => (t.id === task.id ? { ...t, status: newStatus, completed_at: completedAt } : t)))
 
     const { error } = await supabase
       .from('tasks')
       .update({ status: newStatus, completed_at: completedAt })
       .eq('id', task.id)
 
-    if (error) reloadTasks()
-    else if (filter !== 'all') reloadTasks()
+    if (error) {
+      console.error('toggle error:', error)
+      // rollback via reload
+      const hId = householdId || localStorage.getItem(STORAGE_KEY)
+      if (hId) loadTasksForHousehold(hId)
+    } else {
+      // si filtre != all, on recharge pour éviter incohérences
+      if (filter !== 'all') {
+        const hId = householdId || localStorage.getItem(STORAGE_KEY)
+        if (hId) loadTasksForHousehold(hId)
+      }
+    }
   }
 
   const handleDeleteTask = async (taskId: string) => {
     if (!confirm('Supprimer cette tâche ?')) return
-    try {
-      const { error } = await supabase.from('tasks').delete().eq('id', taskId)
-      if (error) throw error
-      setTasks((current) => current.filter((t) => t.id !== taskId))
-    } catch (error) {
-      reloadTasks()
+
+    // Optimistic remove
+    setTasks((current) => current.filter((t) => t.id !== taskId))
+
+    const { error } = await supabase.from('tasks').delete().eq('id', taskId)
+    if (error) {
+      console.error('delete error:', error)
+      const hId = householdId || localStorage.getItem(STORAGE_KEY)
+      if (hId) loadTasksForHousehold(hId)
     }
   }
 
-  const getCategoryStyle = (category: string) => {
-    return CATEGORIES.find((c) => c.value === category)?.color || CATEGORIES[0].color
-  }
-
-  const pendingCount = tasks.filter((t) => t.status !== 'completed').length
-  const completedCount = tasks.filter((t) => t.status === 'completed').length
-
+  /** ========= UI states ========= */
   if (loading) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-gray-50">
@@ -346,22 +380,34 @@ export default function Tasks() {
           <h2 className="text-xl font-bold text-gray-900 mb-2">Problème de synchronisation</h2>
           <p className="text-gray-600 mb-6">{error}</p>
 
-          <button
-            onClick={handleHardRefresh}
-            className="w-full py-3 bg-blue-600 text-white rounded-xl hover:bg-blue-700 transition font-medium shadow-md flex items-center justify-center gap-2"
-          >
-            <RefreshCw className="w-5 h-5" />
-            Réinitialiser la connexion
-          </button>
+          <div className="flex gap-3">
+            <button
+              onClick={() => {
+                setError(null)
+                const hId = householdId || localStorage.getItem(STORAGE_KEY)
+                if (hId) loadTasksForHousehold(hId)
+              }}
+              className="flex-1 py-3 bg-gray-900 text-white rounded-xl hover:bg-black transition font-medium shadow-md"
+            >
+              Réessayer
+            </button>
 
-          <p className="text-xs text-gray-400 mt-4">
-            Ceci va nettoyer le cache local et recharger vos données proprement.
-          </p>
+            <button
+              onClick={hardReset}
+              className="flex-1 py-3 bg-blue-600 text-white rounded-xl hover:bg-blue-700 transition font-medium shadow-md flex items-center justify-center gap-2"
+            >
+              <RefreshCw className="w-5 h-5" />
+              Hard Reset
+            </button>
+          </div>
+
+          <p className="text-xs text-gray-400 mt-4">Le Hard Reset supprime le cache local “household_id” et recharge proprement.</p>
         </div>
       </div>
     )
   }
 
+  /** ========= Page ========= */
   return (
     <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-50">
       <nav className="bg-white shadow-sm border-b">
@@ -376,6 +422,7 @@ export default function Tasks() {
                 </div>
               </button>
             </div>
+
             <button
               onClick={handleLogout}
               className="flex items-center px-4 py-2 text-sm text-gray-700 hover:text-gray-900 hover:bg-gray-100 rounded-lg transition"
@@ -395,6 +442,7 @@ export default function Tasks() {
               {pendingCount} en cours • {completedCount} complétées
             </p>
           </div>
+
           <button
             onClick={() => setShowModal(true)}
             className="flex items-center px-6 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition font-medium shadow-lg hover:shadow-xl"
@@ -404,12 +452,14 @@ export default function Tasks() {
           </button>
         </div>
 
+        {/* Filtres */}
         <div className="bg-white rounded-xl shadow-sm p-4 mb-6 border border-gray-100">
           <div className="flex flex-wrap gap-4 items-center">
             <div className="flex items-center gap-2">
               <Filter className="w-5 h-5 text-gray-500" />
               <span className="text-sm font-medium text-gray-700">Filtres :</span>
             </div>
+
             <div className="flex gap-2">
               <button
                 onClick={() => setFilter('all')}
@@ -436,6 +486,7 @@ export default function Tasks() {
                 Complétées
               </button>
             </div>
+
             <div className="flex gap-2 items-center ml-auto">
               <User className="w-4 h-4 text-gray-500" />
               <select
@@ -444,9 +495,9 @@ export default function Tasks() {
                 className="px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:border-transparent"
               >
                 <option value="">Tous les membres</option>
-                {members.map((member) => (
-                  <option key={member.id} value={member.id}>
-                    {member.display_name}
+                {members.map((m) => (
+                  <option key={m.id} value={m.id}>
+                    {m.display_name}
                   </option>
                 ))}
               </select>
@@ -454,6 +505,7 @@ export default function Tasks() {
           </div>
         </div>
 
+        {/* Liste */}
         <div className="space-y-3">
           {tasks.length === 0 ? (
             <div className="bg-white rounded-xl shadow-sm p-12 text-center border border-gray-100">
@@ -498,7 +550,7 @@ export default function Tasks() {
                             {CATEGORIES.find((c) => c.value === task.category)?.label}
                           </span>
 
-                          {task.members && (
+                          {task.members?.display_name && (
                             <span className="flex items-center text-xs text-gray-600">
                               <User className="w-3 h-3 mr-1" />
                               {task.members.display_name}
@@ -516,15 +568,13 @@ export default function Tasks() {
                         </div>
                       </div>
 
-                      <div className="flex gap-2">
-                        <button
-                          onClick={() => handleDeleteTask(task.id)}
-                          className="p-2 text-red-600 hover:bg-red-50 rounded-lg transition"
-                          title="Supprimer"
-                        >
-                          <Trash2 className="w-5 h-5" />
-                        </button>
-                      </div>
+                      <button
+                        onClick={() => handleDeleteTask(task.id)}
+                        className="p-2 text-red-600 hover:bg-red-50 rounded-lg transition"
+                        title="Supprimer"
+                      >
+                        <Trash2 className="w-5 h-5" />
+                      </button>
                     </div>
                   </div>
                 </div>
@@ -534,12 +584,17 @@ export default function Tasks() {
         </div>
       </main>
 
+      {/* Modal */}
       {showModal && (
         <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4 z-50">
           <div className="bg-white rounded-2xl shadow-2xl max-w-2xl w-full max-h-[90vh] overflow-y-auto">
             <div className="sticky top-0 bg-white border-b px-6 py-4 flex justify-between items-center">
               <h3 className="text-2xl font-bold text-gray-900">Créer une tâche</h3>
-              <button onClick={() => setShowModal(false)} className="p-2 hover:bg-gray-100 rounded-lg transition" disabled={isSubmitting}>
+              <button
+                onClick={() => setShowModal(false)}
+                className="p-2 hover:bg-gray-100 rounded-lg transition"
+                disabled={isSubmitting}
+              >
                 <X className="w-5 h-5" />
               </button>
             </div>
@@ -550,7 +605,7 @@ export default function Tasks() {
                 <input
                   type="text"
                   value={formData.title}
-                  onChange={(e) => setFormData({ ...formData, title: e.target.value })}
+                  onChange={(e) => setFormData((p) => ({ ...p, title: e.target.value }))}
                   placeholder="Ex: Faire les courses"
                   className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
                   required
@@ -562,7 +617,7 @@ export default function Tasks() {
                 <label className="block text-sm font-medium text-gray-700 mb-2">Description</label>
                 <textarea
                   value={formData.description}
-                  onChange={(e) => setFormData({ ...formData, description: e.target.value })}
+                  onChange={(e) => setFormData((p) => ({ ...p, description: e.target.value }))}
                   placeholder="Détails de la tâche..."
                   rows={3}
                   className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
@@ -575,7 +630,7 @@ export default function Tasks() {
                   <label className="block text-sm font-medium text-gray-700 mb-2">Catégorie</label>
                   <select
                     value={formData.category}
-                    onChange={(e) => setFormData({ ...formData, category: e.target.value })}
+                    onChange={(e) => setFormData((p) => ({ ...p, category: e.target.value }))}
                     className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
                     disabled={isSubmitting}
                   >
@@ -591,14 +646,14 @@ export default function Tasks() {
                   <label className="block text-sm font-medium text-gray-700 mb-2">Assigner à</label>
                   <select
                     value={formData.assigned_to}
-                    onChange={(e) => setFormData({ ...formData, assigned_to: e.target.value })}
+                    onChange={(e) => setFormData((p) => ({ ...p, assigned_to: e.target.value }))}
                     className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
                     disabled={isSubmitting}
                   >
                     <option value="">Non assigné</option>
-                    {members.map((member) => (
-                      <option key={member.id} value={member.id}>
-                        {member.display_name}
+                    {members.map((m) => (
+                      <option key={m.id} value={m.id}>
+                        {m.display_name}
                       </option>
                     ))}
                   </select>
@@ -611,7 +666,7 @@ export default function Tasks() {
                   <input
                     type="date"
                     value={formData.due_date}
-                    onChange={(e) => setFormData({ ...formData, due_date: e.target.value })}
+                    onChange={(e) => setFormData((p) => ({ ...p, due_date: e.target.value }))}
                     className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
                     disabled={isSubmitting}
                   />
@@ -622,9 +677,9 @@ export default function Tasks() {
                   <input
                     type="number"
                     value={formData.points}
-                    onChange={(e) => setFormData({ ...formData, points: parseInt(e.target.value) || 1 })}
-                    min="1"
-                    max="100"
+                    onChange={(e) => setFormData((p) => ({ ...p, points: parseInt(e.target.value || '10', 10) }))}
+                    min={1}
+                    max={100}
                     className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
                     disabled={isSubmitting}
                   />
@@ -634,7 +689,10 @@ export default function Tasks() {
               <div className="flex gap-3 pt-4">
                 <button
                   type="button"
-                  onClick={() => setShowModal(false)}
+                  onClick={() => {
+                    setShowModal(false)
+                    resetForm()
+                  }}
                   className="flex-1 px-6 py-3 border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50 transition font-medium"
                   disabled={isSubmitting}
                 >
