@@ -75,8 +75,13 @@ function timeout(ms: number) {
   return new Promise((_, reject) => setTimeout(() => reject(new Error('TIMEOUT')), ms))
 }
 
-async function withTimeout<T>(promise: Promise<T>, ms: number, code: string): Promise<T> {
+async function withTimeout<T>(promiseOrBuilder: Promise<T> | any, ms: number, code: string): Promise<T> {
   try {
+    // Si c'est un PostgrestBuilder, on le convertit en Promise
+    const promise = typeof (promiseOrBuilder as any)?.then === 'function' 
+      ? promiseOrBuilder 
+      : Promise.resolve(promiseOrBuilder)
+    
     return (await Promise.race([promise, timeout(ms)])) as T
   } catch (e: any) {
     const err = e instanceof Error ? e : new Error(String(e))
@@ -163,7 +168,7 @@ export default function Tasks() {
 
       if (mountedRef.current) setTasks( (data as Task[]) || [])
     },
-    [filter, safeSet, selectedMemberFilter]
+    [filter, selectedMemberFilter]
   )
 
   const loadInitialData = useCallback(
@@ -202,7 +207,7 @@ export default function Tasks() {
 
       await loadTasksForHousehold(hId)
     },
-    [loadTasksForHousehold, safeSet]
+    [loadTasksForHousehold]
   )
 
   const init = useCallback(async () => {
@@ -254,12 +259,12 @@ export default function Tasks() {
     } finally {
       initInFlightRef.current = false
     }
-  }, [loadInitialData, navigate, safeSet, setUser, user])
+  }, [loadInitialData, navigate, setUser, user])
 
   const retry = useCallback(() => {
     if (mountedRef.current) setError( null)
     init()
-  }, [init, safeSet])
+  }, [init])
 
   useEffect(() => {
     mountedRef.current = true
