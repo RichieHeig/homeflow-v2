@@ -20,12 +20,13 @@ import {
 } from 'lucide-react'
 
 /**
- * ✅ ROBUST Tasks.tsx
+ * ✅ ROBUST Tasks.tsx - OPTIMIZED
  * - init robuste (getSession + getUser + auth listener)
  * - timeouts sur appels Supabase
  * - écran erreur + retry + hard reset
  * - création tâche : timeout + reset UI garanti + refresh tasks
  * - évite les loaders infinis
+ * - update optimiste pour meilleure UX
  */
 
 interface Task {
@@ -78,10 +79,8 @@ async function withTimeout<T>(promise: Promise<T>, ms: number, code: string): Pr
   try {
     return (await Promise.race([promise, timeout(ms)])) as T
   } catch (e: any) {
-    // tag l’erreur
     const err = e instanceof Error ? e : new Error(String(e))
     ;(err as any).code = (err as any).code || code
-    // si c’est le timeout() interne :
     if (err.message === 'TIMEOUT') (err as any).code = code
     throw err
   }
@@ -172,7 +171,6 @@ export default function Tasks() {
 
   const loadInitialData = useCallback(
     async (userId: string) => {
-      // 1) récupère household via member
       const memberQuery = supabase
         .from('members')
         .select('household_id, households(id, name)')
@@ -190,14 +188,12 @@ export default function Tasks() {
       safeSet(setHousehold, { id: hId, name: hName || 'Famille' })
       safeSet(setHouseholdId, hId)
 
-      // 2) cache pour fallback (mais on ne DOIT jamais dépendre uniquement du cache)
       try {
         localStorage.setItem(LS_HOUSEHOLD_ID_KEY, hId)
       } catch {
         // ignore
       }
 
-      // 3) membres household
       const membersQuery = supabase
         .from('members')
         .select('id, display_name')
@@ -207,7 +203,6 @@ export default function Tasks() {
       if (membersError) throw membersError
       safeSet(setMembers, (membersData as Member[]) || [])
 
-      // 4) tasks
       await loadTasksForHousehold(hId)
     },
     [loadTasksForHousehold, safeSet]
@@ -221,14 +216,12 @@ export default function Tasks() {
     safeSet(setError, null)
 
     try {
-      // A) si store vide, on tente session
       if (!user) {
         const sessionRes = await withTimeout(supabase.auth.getSession(), 10000, 'SESSION_TIMEOUT')
         const sessionUser = sessionRes.data.session?.user ?? null
         if (sessionUser) setUser(sessionUser)
       }
 
-      // B) user "source de vérité"
       const userRes = await withTimeout(supabase.auth.getUser(), 10000, 'GETUSER_TIMEOUT')
       const currentUser = userRes.data.user
       if (!currentUser) {
@@ -237,14 +230,12 @@ export default function Tasks() {
         return
       }
 
-      // C) charge data
       await loadInitialData(currentUser.id)
 
       safeSet(setLoading, false)
     } catch (e: any) {
       console.error('[Tasks:init] error', e)
 
-      // Si cache potentiellement pourri, on le supprime (mais on ne reload pas automatiquement)
       try {
         localStorage.removeItem(LS_HOUSEHOLD_ID_KEY)
       } catch {
@@ -269,7 +260,6 @@ export default function Tasks() {
   }, [loadInitialData, navigate, safeSet, setUser, user])
 
   const retry = useCallback(() => {
-    // reset UI + relance init
     safeSet(setError, null)
     init()
   }, [init, safeSet])
@@ -281,7 +271,6 @@ export default function Tasks() {
     }
   }, [])
 
-  // Auth listener (robuste après retour d’onglet / refresh tokens)
   useEffect(() => {
     const { data: sub } = supabase.auth.onAuthStateChange((_event, session) => {
       const nextUser = session?.user ?? null
@@ -292,13 +281,11 @@ export default function Tasks() {
     }
   }, [setUser])
 
-  // Init unique au montage
   useEffect(() => {
     init()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  // Reload tasks quand filtres changent (si on a un household id fiable)
   useEffect(() => {
     const hId = householdId || (() => {
       try {
@@ -308,13 +295,10 @@ export default function Tasks() {
       }
     })()
 
-    if (!hId) return
-    if (loading) return
-    if (error) return
+    if (!hId || loading || error) return
 
     loadTasksForHousehold(hId).catch((e) => {
       console.error('[Tasks:filters] reload error', e)
-      // on ne bloque pas l’UI, mais on peut afficher une erreur légère
     })
   }, [filter, selectedMemberFilter, householdId, loading, error, loadTasksForHousehold])
 
@@ -332,22 +316,20 @@ export default function Tasks() {
         return
       }
 
-      const hId =
-        householdId ||
-        (() => {
-          try {
-            return localStorage.getItem(LS_HOUSEHOLD_ID_KEY)
-          } catch {
-            return null
-          }
-        })()
+      const hId = householdId || (() => {
+        try {
+          return localStorage.getItem(LS_HOUSEHOLD_ID_KEY)
+        } catch {
+          return null
+        }
+      })()
 
       if (!hId) throw Object.assign(new Error('Famille introuvable. Réessaye.'), { code: 'NO_HOUSEHOLD' })
 
       const payload = {
         household_id: hId,
         title: formData.title.trim(),
-        description: formData.description?.trim() ? formData.description.trim() : null,
+        description: formData.description?.trim() || null,
         category: formData.category,
         assigned_to: formData.assigned_to || null,
         created_by: currentUser.id,
@@ -356,7 +338,7 @@ export default function Tasks() {
         status: 'pending' as const,
       }
 
-      // Insert + return row join
+      // ✅ FIX: Insertion avec .single() pour récupérer la ligne complète
       const insertQuery = supabase
         .from('tasks')
         .insert(payload)
@@ -366,7 +348,7 @@ export default function Tasks() {
       const { data: inserted, error: insErr } = await withTimeout(insertQuery, 12000, 'INSERT_TIMEOUT')
       if (insErr) throw insErr
 
-      // reset form
+      // Reset form IMMÉDIATEMENT
       safeSet(setFormData, {
         title: '',
         description: '',
@@ -376,22 +358,28 @@ export default function Tasks() {
         points: 10,
       })
 
-      // Ferme modal vite, puis refresh (le refresh respecte les filtres)
+      // Fermer modal IMMÉDIATEMENT
       safeSet(setShowModal, false)
 
-      // Pour éviter “ça n’apparaît pas”, on fait :
-      // 1) update optimiste SI le filtre permet de voir la tâche
+      // ✅ FIX: Update optimiste AVANT le refresh serveur
       const canShowInCurrentView =
         filter === 'all' ||
-        (filter === 'pending' && (inserted as Task).status !== 'completed') ||
-        (filter === 'completed' && (inserted as Task).status === 'completed')
+        (filter === 'pending' && inserted.status !== 'completed') ||
+        (filter === 'completed' && inserted.status === 'completed')
 
-      if (canShowInCurrentView) {
-        safeSet(setTasks, (current) => [inserted as any, ...(current || [])])
+      if (canShowInCurrentView && inserted) {
+        // Ajouter la tâche INSTANTANÉMENT à la liste
+        safeSet(setTasks, (current) => [inserted as Task, ...current])
       }
 
-      // 2) refresh serveur (source de vérité)
-      await loadTasksForHousehold(hId)
+      // ✅ FIX: Refresh serveur APRÈS (pour synchroniser)
+      // Utiliser setTimeout pour éviter les conflits React
+      setTimeout(() => {
+        loadTasksForHousehold(hId).catch((e) => {
+          console.error('[Tasks:create] refresh error', e)
+        })
+      }, 100)
+
     } catch (err: any) {
       console.error('[Tasks:create] error', err)
 
@@ -404,7 +392,6 @@ export default function Tasks() {
       if (isNetworkish) {
         const ok = confirm('Connexion instable. Voulez-vous Réessayer ? (Annuler = Hard Reset)')
         if (ok) {
-          // on retente une fois via init (re-sync complet)
           retry()
         } else {
           hardReset()
@@ -421,33 +408,41 @@ export default function Tasks() {
     const newStatus: Task['status'] = task.status === 'completed' ? 'pending' : 'completed'
     const completedAt = newStatus === 'completed' ? new Date().toISOString() : null
 
-    // Optimiste
-    safeSet(setTasks, (current) => current.map((t) => (t.id === task.id ? { ...t, status: newStatus, completed_at: completedAt } : t)))
+    // Update optimiste
+    safeSet(setTasks, (current) => 
+      current.map((t) => (t.id === task.id ? { ...t, status: newStatus, completed_at: completedAt } : t))
+    )
 
-    const updateQuery = supabase
-      .from('tasks')
-      .update({ status: newStatus, completed_at: completedAt })
-      .eq('id', task.id)
+    try {
+      const updateQuery = supabase
+        .from('tasks')
+        .update({ status: newStatus, completed_at: completedAt })
+        .eq('id', task.id)
 
-    const { error: upErr } = await withTimeout(updateQuery, 12000, 'UPDATE_TIMEOUT')
-    if (upErr) {
-      // rollback par reload
-      const hId = householdId || (localStorage.getItem(LS_HOUSEHOLD_ID_KEY) ?? '')
-      if (hId) loadTasksForHousehold(hId).catch(() => {})
-      return
-    }
+      const { error: upErr } = await withTimeout(updateQuery, 12000, 'UPDATE_TIMEOUT')
+      if (upErr) throw upErr
 
-    // Si filtre courant exclut la tâche, refresh
-    if (filter !== 'all') {
-      const hId = householdId || (localStorage.getItem(LS_HOUSEHOLD_ID_KEY) ?? '')
-      if (hId) loadTasksForHousehold(hId).catch(() => {})
+      // Si filtre actif, refresh pour retirer la tâche de la vue
+      if (filter !== 'all') {
+        const hId = householdId || localStorage.getItem(LS_HOUSEHOLD_ID_KEY)
+        if (hId) {
+          setTimeout(() => {
+            loadTasksForHousehold(hId).catch(() => {})
+          }, 100)
+        }
+      }
+    } catch (e) {
+      console.error('[Tasks:toggle] error', e)
+      // Rollback optimiste
+      safeSet(setTasks, (current) => 
+        current.map((t) => (t.id === task.id ? task : t))
+      )
     }
   }
 
   const handleDeleteTask = async (taskId: string) => {
     if (!confirm('Supprimer cette tâche ?')) return
 
-    // Optimiste
     const prev = tasks
     safeSet(setTasks, (current) => current.filter((t) => t.id !== taskId))
 
@@ -457,7 +452,6 @@ export default function Tasks() {
       if (delErr) throw delErr
     } catch (e) {
       console.error('[Tasks:delete] error', e)
-      // rollback
       safeSet(setTasks, prev)
     }
   }
@@ -515,7 +509,7 @@ export default function Tasks() {
           </div>
 
           <p className="text-xs text-gray-400 mt-4">
-            Astuce : si tu as changé d’onglet longtemps, la session peut expirer. « Réessayer » suffit souvent.
+            Astuce : si tu as changé d'onglet longtemps, la session peut expirer. « Réessayer » suffit souvent.
           </p>
         </div>
       </div>
@@ -841,7 +835,7 @@ export default function Tasks() {
               </div>
 
               <p className="text-xs text-gray-400">
-                Si tu reviens après avoir changé d’onglet et que ça bloque, clique « Sync » (en haut) ou « Réessayer ».
+                Astuce : Si le modal reste bloqué, clique « Sync » en haut ou rafraîchis la page.
               </p>
             </form>
           </div>
