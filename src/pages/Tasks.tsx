@@ -117,9 +117,6 @@ export default function Tasks() {
     points: 10,
   })
 
-  const safeSet = useCallback(<T,>(setter: React.Dispatch<React.SetStateAction<T>>, value: React.SetStateAction<T>) => {
-    if (mountedRef.current) setter(value)
-  }, [])
 
   const hardReset = useCallback(() => {
     try {
@@ -164,7 +161,7 @@ export default function Tasks() {
       const { data, error: qErr } = await withTimeout(query, 12000, 'TASKS_TIMEOUT')
       if (qErr) throw qErr
 
-      safeSet(setTasks, (data as Task[]) || [])
+      if (mountedRef.current) setTasks( (data as Task[]) || [])
     },
     [filter, safeSet, selectedMemberFilter]
   )
@@ -185,8 +182,8 @@ export default function Tasks() {
       const hName = householdData?.name as string | undefined
       if (!hId) throw new Error('Household introuvable')
 
-      safeSet(setHousehold, { id: hId, name: hName || 'Famille' })
-      safeSet(setHouseholdId, hId)
+      if (mountedRef.current) setHousehold( { id: hId, name: hName || 'Famille' })
+      if (mountedRef.current) setHouseholdId( hId)
 
       try {
         localStorage.setItem(LS_HOUSEHOLD_ID_KEY, hId)
@@ -201,7 +198,7 @@ export default function Tasks() {
 
       const { data: membersData, error: membersError } = await withTimeout(membersQuery, 12000, 'MEMBERS_TIMEOUT')
       if (membersError) throw membersError
-      safeSet(setMembers, (membersData as Member[]) || [])
+      if (mountedRef.current) setMembers( (membersData as Member[]) || [])
 
       await loadTasksForHousehold(hId)
     },
@@ -212,8 +209,8 @@ export default function Tasks() {
     if (initInFlightRef.current) return
     initInFlightRef.current = true
 
-    safeSet(setLoading, true)
-    safeSet(setError, null)
+    if (mountedRef.current) setLoading( true)
+    if (mountedRef.current) setError( null)
 
     try {
       if (!user) {
@@ -225,14 +222,14 @@ export default function Tasks() {
       const userRes = await withTimeout(supabase.auth.getUser(), 10000, 'GETUSER_TIMEOUT')
       const currentUser = userRes.data.user
       if (!currentUser) {
-        safeSet(setLoading, false)
+        if (mountedRef.current) setLoading( false)
         navigate('/login')
         return
       }
 
       await loadInitialData(currentUser.id)
 
-      safeSet(setLoading, false)
+      if (mountedRef.current) setLoading( false)
     } catch (e: any) {
       console.error('[Tasks:init] error', e)
 
@@ -252,15 +249,15 @@ export default function Tasks() {
           ? 'Impossible de charger les tâches. Clique sur Réessayer.'
           : 'Erreur de synchronisation. Clique sur Réessayer (ou Hard Reset).'
 
-      safeSet(setError, msg)
-      safeSet(setLoading, false)
+      if (mountedRef.current) setError( msg)
+      if (mountedRef.current) setLoading( false)
     } finally {
       initInFlightRef.current = false
     }
   }, [loadInitialData, navigate, safeSet, setUser, user])
 
   const retry = useCallback(() => {
-    safeSet(setError, null)
+    if (mountedRef.current) setError( null)
     init()
   }, [init, safeSet])
 
@@ -306,7 +303,7 @@ export default function Tasks() {
     e.preventDefault()
     if (isSubmitting) return
 
-    safeSet(setIsSubmitting, true)
+    if (mountedRef.current) setIsSubmitting( true)
 
     try {
       const userRes = await withTimeout(supabase.auth.getUser(), 8000, 'GETUSER_TIMEOUT')
@@ -349,7 +346,7 @@ export default function Tasks() {
       if (insErr) throw insErr
 
       // Reset form IMMÉDIATEMENT
-      safeSet(setFormData, {
+      if (mountedRef.current) setFormData( {
         title: '',
         description: '',
         category: 'general',
@@ -359,7 +356,7 @@ export default function Tasks() {
       })
 
       // Fermer modal IMMÉDIATEMENT
-      safeSet(setShowModal, false)
+      if (mountedRef.current) setShowModal( false)
 
       // ✅ FIX: Update optimiste AVANT le refresh serveur
       const canShowInCurrentView =
@@ -369,7 +366,7 @@ export default function Tasks() {
 
       if (canShowInCurrentView && inserted) {
         // Ajouter la tâche INSTANTANÉMENT à la liste
-        safeSet(setTasks, (current) => [inserted as Task, ...current])
+        if (mountedRef.current) setTasks( (current) => [inserted as Task, ...current])
       }
 
       // ✅ FIX: Refresh serveur APRÈS (pour synchroniser)
@@ -400,7 +397,7 @@ export default function Tasks() {
         alert(err?.message || 'Erreur lors de la création')
       }
     } finally {
-      safeSet(setIsSubmitting, false)
+      if (mountedRef.current) setIsSubmitting( false)
     }
   }
 
@@ -409,7 +406,7 @@ export default function Tasks() {
     const completedAt = newStatus === 'completed' ? new Date().toISOString() : null
 
     // Update optimiste
-    safeSet(setTasks, (current) => 
+    if (mountedRef.current) setTasks( (current) => 
       current.map((t) => (t.id === task.id ? { ...t, status: newStatus, completed_at: completedAt } : t))
     )
 
@@ -434,7 +431,7 @@ export default function Tasks() {
     } catch (e) {
       console.error('[Tasks:toggle] error', e)
       // Rollback optimiste
-      safeSet(setTasks, (current) => 
+      if (mountedRef.current) setTasks( (current) => 
         current.map((t) => (t.id === task.id ? task : t))
       )
     }
@@ -444,7 +441,7 @@ export default function Tasks() {
     if (!confirm('Supprimer cette tâche ?')) return
 
     const prev = tasks
-    safeSet(setTasks, (current) => current.filter((t) => t.id !== taskId))
+    if (mountedRef.current) setTasks( (current) => current.filter((t) => t.id !== taskId))
 
     try {
       const delQuery = supabase.from('tasks').delete().eq('id', taskId)
@@ -452,7 +449,7 @@ export default function Tasks() {
       if (delErr) throw delErr
     } catch (e) {
       console.error('[Tasks:delete] error', e)
-      safeSet(setTasks, prev)
+      if (mountedRef.current) setTasks( prev)
     }
   }
 
