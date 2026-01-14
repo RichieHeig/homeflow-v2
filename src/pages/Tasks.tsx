@@ -370,9 +370,10 @@ export default function Tasks() {
       }
       const { data: inserted, error: insErr } = insertResult
       if (insErr) throw insErr
+      if (!inserted) throw new Error('Aucune donnée retournée après insertion')
 
       // Reset form IMMÉDIATEMENT
-      if (mountedRef.current) setFormData( {
+      if (mountedRef.current) setFormData({
         title: '',
         description: '',
         category: 'general',
@@ -382,7 +383,7 @@ export default function Tasks() {
       })
 
       // Fermer modal IMMÉDIATEMENT
-      if (mountedRef.current) setShowModal( false)
+      if (mountedRef.current) setShowModal(false)
 
       // ✅ FIX: Update optimiste AVANT le refresh serveur
       const canShowInCurrentView =
@@ -390,9 +391,9 @@ export default function Tasks() {
         (filter === 'pending' && inserted.status !== 'completed') ||
         (filter === 'completed' && inserted.status === 'completed')
 
-      if (canShowInCurrentView && inserted) {
+      if (canShowInCurrentView) {
         // Ajouter la tâche INSTANTANÉMENT à la liste
-        if (mountedRef.current) setTasks( (current) => [inserted as Task, ...current])
+        if (mountedRef.current) setTasks((current) => [inserted, ...current])
       }
 
       // ✅ FIX: Refresh serveur APRÈS (pour synchroniser)
