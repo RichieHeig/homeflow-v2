@@ -163,10 +163,11 @@ export default function Tasks() {
 
       if (selectedMemberFilter) query = query.eq('assigned_to', selectedMemberFilter)
 
-      const { data, error: qErr } = await withTimeout(query, 12000, 'TASKS_TIMEOUT')
+      const result = await withTimeout(query, 12000, 'TASKS_TIMEOUT') as { data: Task[] | null; error: any }
+      const { data, error: qErr } = result
       if (qErr) throw qErr
 
-      if (mountedRef.current) setTasks( (data as Task[]) || [])
+      if (mountedRef.current) setTasks(data || [])
     },
     [filter, selectedMemberFilter]
   )
@@ -179,7 +180,11 @@ export default function Tasks() {
         .eq('id', userId)
         .single()
 
-      const { data: memberData, error: memberError } = await withTimeout(memberQuery, 12000, 'MEMBER_TIMEOUT')
+      const memberResult = await withTimeout(memberQuery, 12000, 'MEMBER_TIMEOUT') as { 
+        data: { household_id: string; households: any } | null; 
+        error: any 
+      }
+      const { data: memberData, error: memberError } = memberResult
       if (memberError || !memberData) throw memberError || new Error('Aucune donnée membre')
 
       const householdData = memberData.households as any
@@ -201,9 +206,13 @@ export default function Tasks() {
         .select('id, display_name')
         .eq('household_id', memberData.household_id)
 
-      const { data: membersData, error: membersError } = await withTimeout(membersQuery, 12000, 'MEMBERS_TIMEOUT')
+      const membersResult = await withTimeout(membersQuery, 12000, 'MEMBERS_TIMEOUT') as {
+        data: Member[] | null;
+        error: any
+      }
+      const { data: membersData, error: membersError } = membersResult
       if (membersError) throw membersError
-      if (mountedRef.current) setMembers( (membersData as Member[]) || [])
+      if (mountedRef.current) setMembers(membersData || [])
 
       await loadTasksForHousehold(hId)
     },
@@ -219,15 +228,21 @@ export default function Tasks() {
 
     try {
       if (!user) {
-        const sessionRes = await withTimeout(supabase.auth.getSession(), 10000, 'SESSION_TIMEOUT')
+        const sessionRes = await withTimeout(supabase.auth.getSession(), 10000, 'SESSION_TIMEOUT') as {
+          data: { session: { user: any } | null };
+          error: any;
+        }
         const sessionUser = sessionRes.data.session?.user ?? null
         if (sessionUser) setUser(sessionUser)
       }
 
-      const userRes = await withTimeout(supabase.auth.getUser(), 10000, 'GETUSER_TIMEOUT')
+      const userRes = await withTimeout(supabase.auth.getUser(), 10000, 'GETUSER_TIMEOUT') as {
+        data: { user: any };
+        error: any;
+      }
       const currentUser = userRes.data.user
       if (!currentUser) {
-        if (mountedRef.current) setLoading( false)
+        if (mountedRef.current) setLoading(false)
         navigate('/login')
         return
       }
@@ -311,7 +326,10 @@ export default function Tasks() {
     if (mountedRef.current) setIsSubmitting( true)
 
     try {
-      const userRes = await withTimeout(supabase.auth.getUser(), 8000, 'GETUSER_TIMEOUT')
+      const userRes = await withTimeout(supabase.auth.getUser(), 8000, 'GETUSER_TIMEOUT') as {
+        data: { user: any };
+        error: any;
+      }
       const currentUser = userRes.data.user
       if (!currentUser) {
         await logout()
@@ -340,14 +358,17 @@ export default function Tasks() {
         status: 'pending' as const,
       }
 
-      // ✅ FIX: Insertion avec .single() pour récupérer la ligne complète
       const insertQuery = supabase
         .from('tasks')
         .insert(payload)
         .select('*, members:assigned_to(display_name)')
         .single()
 
-      const { data: inserted, error: insErr } = await withTimeout(insertQuery, 12000, 'INSERT_TIMEOUT')
+      const insertResult = await withTimeout(insertQuery, 12000, 'INSERT_TIMEOUT') as {
+        data: Task | null;
+        error: any;
+      }
+      const { data: inserted, error: insErr } = insertResult
       if (insErr) throw insErr
 
       // Reset form IMMÉDIATEMENT
@@ -421,7 +442,11 @@ export default function Tasks() {
         .update({ status: newStatus, completed_at: completedAt })
         .eq('id', task.id)
 
-      const { error: upErr } = await withTimeout(updateQuery, 12000, 'UPDATE_TIMEOUT')
+      const updateResult = await withTimeout(updateQuery, 12000, 'UPDATE_TIMEOUT') as {
+        data: any;
+        error: any;
+      }
+      const { error: upErr } = updateResult
       if (upErr) throw upErr
 
       // Si filtre actif, refresh pour retirer la tâche de la vue
@@ -450,7 +475,11 @@ export default function Tasks() {
 
     try {
       const delQuery = supabase.from('tasks').delete().eq('id', taskId)
-      const { error: delErr } = await withTimeout(delQuery, 12000, 'DELETE_TIMEOUT')
+      const deleteResult = await withTimeout(delQuery, 12000, 'DELETE_TIMEOUT') as {
+        data: any;
+        error: any;
+      }
+      const { error: delErr } = deleteResult
       if (delErr) throw delErr
     } catch (e) {
       console.error('[Tasks:delete] error', e)
