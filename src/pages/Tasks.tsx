@@ -228,7 +228,7 @@ export default function Tasks() {
 
     try {
       if (!user) {
-        const sessionRes = await withTimeout(supabase.auth.getSession(), 10000, 'SESSION_TIMEOUT') as {
+        const sessionRes = await withTimeout(supabase.auth.getSession(), 8000, 'SESSION_TIMEOUT') as {
           data: { session: { user: any } | null };
           error: any;
         }
@@ -236,7 +236,7 @@ export default function Tasks() {
         if (sessionUser) setUser(sessionUser)
       }
 
-      const userRes = await withTimeout(supabase.auth.getUser(), 10000, 'GETUSER_TIMEOUT') as {
+      const userRes = await withTimeout(supabase.auth.getUser(), 8000, 'GETUSER_TIMEOUT') as {
         data: { user: any };
         error: any;
       }
@@ -262,12 +262,12 @@ export default function Tasks() {
       const code = e?.code || e?.message
       const msg =
         code === 'SESSION_TIMEOUT' || code === 'GETUSER_TIMEOUT'
-          ? 'Connexion lente : impossible de valider la session. Clique sur Réessayer.'
+          ? 'Session expirée après changement d\'onglet. Clique sur « Réessayer » ci-dessous.'
           : code === 'MEMBER_TIMEOUT' || code === 'MEMBERS_TIMEOUT'
-          ? 'Impossible de charger les données famille/membres. Clique sur Réessayer.'
+          ? 'Impossible de charger tes données famille. Vérifie ta connexion internet puis clique « Réessayer ».'
           : code === 'TASKS_TIMEOUT'
-          ? 'Impossible de charger les tâches. Clique sur Réessayer.'
-          : 'Erreur de synchronisation. Clique sur Réessayer (ou Hard Reset).'
+          ? 'Impossible de charger les tâches. Vérifie ta connexion puis clique « Réessayer ».'
+          : 'Erreur de synchronisation. Vérifie ta connexion internet puis clique « Réessayer ».'
 
       if (mountedRef.current) setError( msg)
       if (mountedRef.current) setLoading( false)
@@ -277,8 +277,18 @@ export default function Tasks() {
   }, [loadInitialData, navigate, setUser, user])
 
   const retry = useCallback(() => {
-    if (mountedRef.current) setError( null)
-    init()
+    if (mountedRef.current) {
+      setError(null)
+      setLoading(true)
+    }
+    
+    // Forcer un vrai refresh
+    initInFlightRef.current = false
+    
+    // Attendre que React nettoie
+    setTimeout(() => {
+      init()
+    }, 100)
   }, [init])
 
   useEffect(() => {
@@ -346,22 +356,6 @@ export default function Tasks() {
 
       if (!hId) throw Object.assign(new Error('Famille introuvable. Réessaye.'), { code: 'NO_HOUSEHOLD' })
 
-      // ✅ Vérifier la connexion avec un ping rapide
-      try {
-        await withTimeout(
-          supabase.from('tasks').select('id').limit(1), 
-          3000, 
-          'PING_TIMEOUT'
-        )
-      } catch (pingErr: any) {
-        if (pingErr.code === 'PING_TIMEOUT') {
-          throw Object.assign(
-            new Error('Connexion lente ou interrompue. Clique « Sync » en haut puis réessaye.'),
-            { code: 'CONNECTION_LOST' }
-          )
-        }
-      }
-
       const payload = {
         household_id: hId,
         title: formData.title.trim(),
@@ -424,25 +418,16 @@ export default function Tasks() {
       console.error('[Tasks:create] error', err)
 
       const code = err?.code || err?.message
-      const isTimeout = code === 'INSERT_TIMEOUT' || code === 'CONNECTION_LOST'
-      const isNetworkish =
-        isTimeout ||
-        String(err?.message || '').toLowerCase().includes('fetch') ||
-        String(err?.message || '').toLowerCase().includes('network')
-
-      if (isTimeout) {
+      
+      if (code === 'INSERT_TIMEOUT' || code === 'CONNECTION_LOST') {
         alert(
-          'La création a échoué car la connexion était trop lente.\n\n' +
-          '✅ Solution : Clique sur « Sync » en haut, puis réessaye.\n\n' +
-          'Si le problème persiste, rafraîchis la page.'
+          'Impossible de créer la tâche (connexion trop lente).\n\n' +
+          '✅ Solution rapide :\n' +
+          '1. Ferme ce modal (clique Annuler)\n' +
+          '2. Clique sur « Sync » en haut\n' +
+          '3. Réessaye de créer la tâche\n\n' +
+          'Si ça persiste, rafraîchis la page (F5).'
         )
-      } else if (isNetworkish) {
-        const ok = confirm('Connexion instable. Voulez-vous Réessayer ? (Annuler = Hard Reset)')
-        if (ok) {
-          retry()
-        } else {
-          hardReset()
-        }
       } else {
         alert(err?.message || 'Erreur lors de la création')
       }
