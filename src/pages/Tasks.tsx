@@ -18,7 +18,7 @@ import {
   RefreshCw,
   AlertTriangle,
   AlertCircle,
-  RotateCcw
+  Zap // Nouvelle icône pour indiquer la reconnexion
 } from 'lucide-react'
 
 // --- Interfaces ---
@@ -72,6 +72,7 @@ export default function Tasks() {
   
   // UI States
   const [loading, setLoading] = useState(true)
+  const [isReconnecting, setIsReconnecting] = useState(false) // Nouvel état pour le Watchdog
   const [error, setError] = useState<string | null>(null)
   const [formError, setFormError] = useState<string | null>(null)
   const [showModal, setShowModal] = useState(false)
@@ -91,6 +92,13 @@ export default function Tasks() {
     points: 10,
   })
 
+  // --- FORCE RELOAD (Cache Buster) ---
+  // C'est ça qui répare le bouton "Réessayer" qui tournait dans le vide
+  const handleForceReload = () => {
+    // On ajoute un timestamp pour forcer le navigateur à ignorer le cache
+    window.location.href = window.location.pathname + '?t=' + new Date().getTime();
+  }
+
   // --- NUCLEAR RESET ---
   const handleHardRefresh = async () => {
     try { await supabase.auth.signOut() } catch (e) { /* ignore */ }
@@ -98,6 +106,44 @@ export default function Tasks() {
     setUser(null)
     window.location.href = '/login'
   }
+
+  // --- WATCHDOG (CHIEN DE GARDE) ---
+  // C'est lui qui détecte quand tu reviens de ta capture d'écran
+  useEffect(() => {
+    const handleVisibilityChange = async () => {
+      if (document.visibilityState === 'visible' && user) {
+        console.log("👀 L'utilisateur est revenu ! Vérification de la connexion...")
+        setIsReconnecting(true)
+        
+        try {
+          // On tente un petit ping léger (récupérer le profil)
+          const { error } = await supabase.from('members').select('id').eq('id', user.id).single()
+          
+          if (error) {
+            console.warn("⚠️ Connexion perdue pendant la veille. Rechargement des données...")
+            // Si le ping échoue, on recharge tout proprement
+            const hId = householdId || localStorage.getItem('homeflow_household_id')
+            if (hId) await loadTasksForHousehold(hId)
+          } else {
+            console.log("✅ Connexion toujours active.")
+          }
+        } catch (e) {
+          console.error("Erreur Watchdog:", e)
+        } finally {
+          setIsReconnecting(false)
+        }
+      }
+    }
+
+    document.addEventListener("visibilitychange", handleVisibilityChange)
+    window.addEventListener("focus", handleVisibilityChange) // Double sécurité
+
+    return () => {
+      document.removeEventListener("visibilitychange", handleVisibilityChange)
+      window.removeEventListener("focus", handleVisibilityChange)
+    }
+  }, [user, householdId])
+
 
   // --- INITIAL LOAD ---
   useEffect(() => {
@@ -159,7 +205,7 @@ export default function Tasks() {
       }
 
       const timeoutPromise = new Promise((_, reject) => 
-        setTimeout(() => reject(new Error('TIMEOUT_STARTUP')), 7000)
+        setTimeout(() => reject(new Error('TIMEOUT_STARTUP')), 8000) // 8s timeout
       )
 
       await Promise.race([fetchDataPromise(), timeoutPromise])
@@ -208,7 +254,7 @@ export default function Tasks() {
     await handleHardRefresh()
   }
 
-  // --- ARCHITECT FIX: SMART RETRY (CORRIGÉ) ---
+  // --- SMART CREATE TASK ---
   const handleCreateTask = async (e: React.FormEvent) => {
     e.preventDefault()
     setFormError(null)
@@ -220,9 +266,9 @@ export default function Tasks() {
       const hId = householdId || localStorage.getItem('homeflow_household_id')
       if (!hId) throw new Error('Famille introuvable. Rafraîchissez la page.')
 
+      // Tentatives multiples (Retry Logic)
       let attempt = 0;
       let success = false;
-      // J'ai supprimé la variable lastError qui posait problème
 
       while(attempt < 2 && !success) {
         attempt++;
@@ -253,13 +299,10 @@ export default function Tasks() {
 
         } catch (err: any) {
           console.warn(`Echec tentative ${attempt}:`, err.message);
-          
-          // Si c'est la 1ère tentative et que c'est un timeout, on attend un peu et on recommence
-          if (attempt === 1 && (err.message === 'TIMEOUT_WRITE' || err.message?.includes('fetch'))) {
-            await new Promise(resolve => setTimeout(resolve, 500)); // Pause 500ms
+          if (attempt === 1) {
+            await new Promise(resolve => setTimeout(resolve, 800)); // Pause plus longue (800ms)
             continue; 
           }
-          // Sinon on arrête
           throw err;
         }
       }
@@ -278,9 +321,8 @@ export default function Tasks() {
 
     } catch (err: any) {
       console.error('Erreur finale:', err)
-      
       if (err.message === 'TIMEOUT_WRITE' || err.message?.includes('fetch')) {
-        setFormError("La connexion ne répond pas malgré les tentatives.")
+        setFormError("La connexion est instable. Essayez de rafraîchir la page.")
       } else {
         setFormError(err.message || 'Une erreur est survenue.')
       }
@@ -339,7 +381,7 @@ export default function Tasks() {
           <h2 className="text-xl font-bold text-gray-900 mb-2">Problème de connexion</h2>
           <p className="text-gray-600 mb-6">{error}</p>
           <div className="space-y-3">
-            <button onClick={() => window.location.reload()} className="w-full py-3 bg-blue-600 text-white rounded-xl hover:bg-blue-700 transition font-medium shadow-md flex items-center justify-center gap-2">
+            <button onClick={handleForceReload} className="w-full py-3 bg-blue-600 text-white rounded-xl hover:bg-blue-700 transition font-medium shadow-md flex items-center justify-center gap-2">
               <RefreshCw className="w-5 h-5" /> Réessayer
             </button>
             <button onClick={handleHardRefresh} className="w-full py-3 bg-white border border-red-200 text-red-600 rounded-xl hover:bg-red-50 transition font-medium flex items-center justify-center gap-2">
@@ -353,6 +395,13 @@ export default function Tasks() {
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-50">
+      {/* Petit indicateur de reconnexion discret en haut */}
+      {isReconnecting && (
+        <div className="bg-yellow-100 text-yellow-800 text-xs py-1 px-4 text-center fixed top-0 w-full z-50 flex items-center justify-center gap-2">
+          <Zap className="w-3 h-3 animate-pulse" /> Rétablissement de la connexion...
+        </div>
+      )}
+
       <nav className="bg-white shadow-sm border-b">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
           <div className="flex justify-between items-center h-16">
@@ -457,10 +506,10 @@ export default function Tasks() {
                   <div><h4 className="text-sm font-medium text-red-800">Erreur</h4><p className="text-sm text-red-600 mt-1">{formError}</p></div>
                 </div>
                 <button 
-                  onClick={() => window.location.reload()} 
+                  onClick={handleForceReload} 
                   className="mt-2 text-sm text-blue-600 font-medium hover:underline flex items-center gap-1 self-end"
                 >
-                  <RotateCcw className="w-4 h-4" /> Rafraîchir la page pour réparer
+                  <RefreshCw className="w-4 h-4" /> Rafraîchir la page pour réparer
                 </button>
               </div>
             )}
