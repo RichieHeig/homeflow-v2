@@ -17,7 +17,7 @@ import {
   WifiOff,
   RefreshCw,
   AlertTriangle,
-  AlertCircle // Nouvelle icône pour les erreurs de formulaire
+  AlertCircle 
 } from 'lucide-react'
 
 // --- Interfaces ---
@@ -71,8 +71,8 @@ export default function Tasks() {
   
   // UI States
   const [loading, setLoading] = useState(true)
-  const [error, setError] = useState<string | null>(null) // Erreur globale (page)
-  const [formError, setFormError] = useState<string | null>(null) // Erreur locale (modal)
+  const [error, setError] = useState<string | null>(null)
+  const [formError, setFormError] = useState<string | null>(null)
   const [showModal, setShowModal] = useState(false)
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [filter, setFilter] = useState<'all' | 'pending' | 'completed'>('pending')
@@ -90,13 +90,12 @@ export default function Tasks() {
     points: 10,
   })
 
-  // --- NUCLEAR RESET (Déconnexion propre et totale) ---
+  // --- NUCLEAR RESET ---
   const handleHardRefresh = async () => {
-    console.log("☢️ NUCLEAR RESET TRIGGERED")
     try { await supabase.auth.signOut() } catch (e) { /* ignore */ }
-    localStorage.clear() // Vide tout le cache
+    localStorage.clear()
     setUser(null)
-    window.location.href = '/login' // Force le rechargement navigateur
+    window.location.href = '/login'
   }
 
   // --- INITIAL LOAD ---
@@ -208,21 +207,20 @@ export default function Tasks() {
     await handleHardRefresh()
   }
 
-  // --- CREATE TASK FIX ---
+  // --- ARCHITECT FIX: CREATE TASK (NON-BLOCKING) ---
   const handleCreateTask = async (e: React.FormEvent) => {
     e.preventDefault()
-    
-    // Reset error state
     setFormError(null)
     
     if (isSubmitting) return
-    setIsSubmitting(true)
+    setIsSubmitting(true) // On bloque le bouton
 
     try {
       if (!user) throw new Error('Utilisateur non connecté')
       const hId = householdId || localStorage.getItem('homeflow_household_id')
       if (!hId) throw new Error('Famille introuvable. Rafraîchissez la page.')
 
+      // Préparation de l'insertion
       const insertPromise = supabase.from('tasks').insert({
         household_id: hId,
         title: formData.title,
@@ -235,16 +233,19 @@ export default function Tasks() {
         status: 'pending',
       })
 
-      // Timeout 5s
+      // Timeout de sécurité 5s
       const timeoutPromise = new Promise((_, reject) => 
         setTimeout(() => reject(new Error('TIMEOUT_WRITE')), 5000)
       )
 
+      // Course : Insertion vs Timeout
       // @ts-ignore
       const result: any = await Promise.race([insertPromise, timeoutPromise])
       if (result.error) throw result.error
 
-      // Succès
+      // --- SUCCÈS --- 
+      
+      // 1. D'abord, on vide le formulaire
       setFormData({
         title: '',
         description: '',
@@ -254,26 +255,26 @@ export default function Tasks() {
         points: 10,
       })
 
-      // On recharge les tâches mais on n'attend pas forcément que ça finisse pour fermer la modale
-      // si la connexion est lente, au moins l'UI est débloquée
-      loadTasksForHousehold(hId)
+      // 2. CRUCIAL : On ferme la modale TOUT DE SUITE. 
+      // On n'attend pas que les tâches se rechargent.
       setShowModal(false)
+
+      // 3. Ensuite, on recharge les données en arrière-plan ("Fire and Forget")
+      // L'utilisateur ne voit plus le spinner, il est libre.
+      loadTasksForHousehold(hId).catch(console.error)
 
     } catch (err: any) {
       console.error('Erreur création:', err)
       
-      // ICI LA CORRECTION : On ne met PAS d'alert() bloquant.
-      // On affiche l'erreur dans la modale et on arrête le spinner.
-      
+      // Affichage de l'erreur dans la modale
       if (err.message === 'TIMEOUT_WRITE' || err.message?.includes('fetch')) {
-        setFormError("La connexion est instable. Veuillez vérifier votre réseau et réessayer.")
+        setFormError("Connexion trop lente. Vérifiez votre réseau.")
       } else {
         setFormError(err.message || 'Une erreur est survenue.')
       }
-      
-      // On force l'arrêt du spinner pour que tu puisses recliquer
-      setIsSubmitting(false) 
+      // On ne ferme PAS la modale en cas d'erreur, pour laisser l'utilisateur réessayer
     } finally {
+      // 4. QUOI QU'IL ARRIVE : On débloque le bouton
       setIsSubmitting(false)
     }
   }
@@ -329,7 +330,6 @@ export default function Tasks() {
     )
   }
 
-  // ÉCRAN D'ERREUR CRITIQUE (Page entière)
   if (error) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-gray-50 px-4">
@@ -337,21 +337,12 @@ export default function Tasks() {
           <WifiOff className="h-16 w-16 text-red-500 mx-auto mb-4" />
           <h2 className="text-xl font-bold text-gray-900 mb-2">Problème de connexion</h2>
           <p className="text-gray-600 mb-6">{error}</p>
-          
           <div className="space-y-3">
-            <button 
-              onClick={() => window.location.reload()}
-              className="w-full py-3 bg-blue-600 text-white rounded-xl hover:bg-blue-700 transition font-medium shadow-md flex items-center justify-center gap-2"
-            >
-              <RefreshCw className="w-5 h-5" />
-              Réessayer
+            <button onClick={() => window.location.reload()} className="w-full py-3 bg-blue-600 text-white rounded-xl hover:bg-blue-700 transition font-medium shadow-md flex items-center justify-center gap-2">
+              <RefreshCw className="w-5 h-5" /> Réessayer
             </button>
-            <button 
-              onClick={handleHardRefresh}
-              className="w-full py-3 bg-white border border-red-200 text-red-600 rounded-xl hover:bg-red-50 transition font-medium flex items-center justify-center gap-2"
-            >
-              <AlertTriangle className="w-5 h-5" />
-              Déconnexion & Reset Cache
+            <button onClick={handleHardRefresh} className="w-full py-3 bg-white border border-red-200 text-red-600 rounded-xl hover:bg-red-50 transition font-medium flex items-center justify-center gap-2">
+              <AlertTriangle className="w-5 h-5" /> Déconnexion & Reset
             </button>
           </div>
         </div>
@@ -373,12 +364,8 @@ export default function Tasks() {
                 </div>
               </button>
             </div>
-            <button
-              onClick={handleLogout}
-              className="flex items-center px-4 py-2 text-sm text-gray-700 hover:text-gray-900 hover:bg-gray-100 rounded-lg transition"
-            >
-              <LogOut className="w-4 h-4 mr-2" />
-              Déconnexion
+            <button onClick={handleLogout} className="flex items-center px-4 py-2 text-sm text-gray-700 hover:text-gray-900 hover:bg-gray-100 rounded-lg transition">
+              <LogOut className="w-4 h-4 mr-2" /> Déconnexion
             </button>
           </div>
         </div>
@@ -390,22 +377,15 @@ export default function Tasks() {
             <h2 className="text-3xl font-bold text-gray-900 mb-2">Tâches familiales</h2>
             <p className="text-gray-600">{pendingCount} en cours • {completedCount} complétées</p>
           </div>
-          <button
-            onClick={() => { setFormError(null); setShowModal(true); }}
-            className="flex items-center px-6 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition font-medium shadow-lg hover:shadow-xl"
-          >
-            <Plus className="w-5 h-5 mr-2" />
-            Nouvelle tâche
+          <button onClick={() => { setFormError(null); setShowModal(true); }} className="flex items-center px-6 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition font-medium shadow-lg hover:shadow-xl">
+            <Plus className="w-5 h-5 mr-2" /> Nouvelle tâche
           </button>
         </div>
 
         {/* --- FILTRES --- */}
         <div className="bg-white rounded-xl shadow-sm p-4 mb-6 border border-gray-100">
           <div className="flex flex-wrap gap-4 items-center">
-            <div className="flex items-center gap-2">
-              <Filter className="w-5 h-5 text-gray-500" />
-              <span className="text-sm font-medium text-gray-700">Filtres :</span>
-            </div>
+            <div className="flex items-center gap-2"><Filter className="w-5 h-5 text-gray-500" /><span className="text-sm font-medium text-gray-700">Filtres :</span></div>
             <div className="flex gap-2">
               <button onClick={() => setFilter('all')} className={`px-4 py-2 rounded-lg text-sm font-medium transition ${filter === 'all' ? 'bg-blue-600 text-white' : 'bg-gray-100 text-gray-700 hover:bg-gray-200'}`}>Toutes</button>
               <button onClick={() => setFilter('pending')} className={`px-4 py-2 rounded-lg text-sm font-medium transition ${filter === 'pending' ? 'bg-blue-600 text-white' : 'bg-gray-100 text-gray-700 hover:bg-gray-200'}`}>En cours</button>
@@ -421,7 +401,7 @@ export default function Tasks() {
           </div>
         </div>
 
-        {/* --- LISTE DES TÂCHES --- */}
+        {/* --- LISTE --- */}
         <div className="space-y-3">
           {tasks.length === 0 ? (
             <div className="bg-white rounded-xl shadow-sm p-12 text-center border border-gray-100">
@@ -460,7 +440,7 @@ export default function Tasks() {
         </div>
       </main>
 
-      {/* --- MODAL (Avec gestion d'erreur intégrée) --- */}
+      {/* --- MODAL --- */}
       {showModal && (
         <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4 z-50">
           <div className="bg-white rounded-2xl shadow-2xl max-w-2xl w-full max-h-[90vh] overflow-y-auto">
@@ -469,14 +449,10 @@ export default function Tasks() {
               <button onClick={() => setShowModal(false)} className="p-2 hover:bg-gray-100 rounded-lg transition" disabled={isSubmitting}><X className="w-5 h-5" /></button>
             </div>
 
-            {/* ERROR BANNER DANS LE MODAL (Non-bloquant) */}
             {formError && (
               <div className="mx-6 mt-4 p-4 bg-red-50 border border-red-200 rounded-lg flex items-start gap-3">
                 <AlertCircle className="w-5 h-5 text-red-600 flex-shrink-0 mt-0.5" />
-                <div>
-                  <h4 className="text-sm font-medium text-red-800">Erreur</h4>
-                  <p className="text-sm text-red-600 mt-1">{formError}</p>
-                </div>
+                <div><h4 className="text-sm font-medium text-red-800">Erreur</h4><p className="text-sm text-red-600 mt-1">{formError}</p></div>
               </div>
             )}
 
