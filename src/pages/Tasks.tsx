@@ -17,7 +17,8 @@ import {
   WifiOff,
   RefreshCw,
   AlertTriangle,
-  AlertCircle 
+  AlertCircle,
+  RotateCcw
 } from 'lucide-react'
 
 // --- Interfaces ---
@@ -207,45 +208,67 @@ export default function Tasks() {
     await handleHardRefresh()
   }
 
-  // --- ARCHITECT FIX: CREATE TASK (NON-BLOCKING) ---
+  // --- ARCHITECT FIX: SMART RETRY ---
   const handleCreateTask = async (e: React.FormEvent) => {
     e.preventDefault()
     setFormError(null)
-    
     if (isSubmitting) return
-    setIsSubmitting(true) // On bloque le bouton
+    setIsSubmitting(true)
 
     try {
       if (!user) throw new Error('Utilisateur non connecté')
       const hId = householdId || localStorage.getItem('homeflow_household_id')
       if (!hId) throw new Error('Famille introuvable. Rafraîchissez la page.')
 
-      // Préparation de l'insertion
-      const insertPromise = supabase.from('tasks').insert({
-        household_id: hId,
-        title: formData.title,
-        description: formData.description || null,
-        category: formData.category,
-        assigned_to: formData.assigned_to || null,
-        created_by: user.id,
-        points: formData.points,
-        due_date: formData.due_date || null,
-        status: 'pending',
-      })
+      // --- LE COEUR DU FIX : BOUCLE DE TENTATIVES (MAX 2) ---
+      let attempt = 0;
+      let success = false;
+      let lastError = null;
 
-      // Timeout de sécurité 5s
-      const timeoutPromise = new Promise((_, reject) => 
-        setTimeout(() => reject(new Error('TIMEOUT_WRITE')), 5000)
-      )
+      while(attempt < 2 && !success) {
+        attempt++;
+        try {
+          console.log(`Tentative création ${attempt}/2...`);
+          
+          const insertPromise = supabase.from('tasks').insert({
+            household_id: hId,
+            title: formData.title,
+            description: formData.description || null,
+            category: formData.category,
+            assigned_to: formData.assigned_to || null,
+            created_by: user.id,
+            points: formData.points,
+            due_date: formData.due_date || null,
+            status: 'pending',
+          })
 
-      // Course : Insertion vs Timeout
-      // @ts-ignore
-      const result: any = await Promise.race([insertPromise, timeoutPromise])
-      if (result.error) throw result.error
+          const timeoutPromise = new Promise((_, reject) => 
+            setTimeout(() => reject(new Error('TIMEOUT_WRITE')), 5000)
+          )
+
+          // @ts-ignore
+          const result: any = await Promise.race([insertPromise, timeoutPromise])
+          if (result.error) throw result.error
+          
+          // Si on arrive ici, c'est gagné !
+          success = true;
+
+        } catch (err: any) {
+          console.warn(`Echec tentative ${attempt}:`, err.message);
+          lastError = err;
+          
+          // Si c'est la 1ère tentative et que c'est un timeout, on attend un peu et on recommence
+          if (attempt === 1 && (err.message === 'TIMEOUT_WRITE' || err.message?.includes('fetch'))) {
+            await new Promise(resolve => setTimeout(resolve, 500)); // Pause 500ms
+            continue; // On repart pour un tour
+          }
+          
+          // Sinon (2ème échec ou autre erreur), on arrête
+          throw err;
+        }
+      }
 
       // --- SUCCÈS --- 
-      
-      // 1. D'abord, on vide le formulaire
       setFormData({
         title: '',
         description: '',
@@ -254,27 +277,18 @@ export default function Tasks() {
         due_date: '',
         points: 10,
       })
-
-      // 2. CRUCIAL : On ferme la modale TOUT DE SUITE. 
-      // On n'attend pas que les tâches se rechargent.
       setShowModal(false)
-
-      // 3. Ensuite, on recharge les données en arrière-plan ("Fire and Forget")
-      // L'utilisateur ne voit plus le spinner, il est libre.
       loadTasksForHousehold(hId).catch(console.error)
 
     } catch (err: any) {
-      console.error('Erreur création:', err)
+      console.error('Erreur finale:', err)
       
-      // Affichage de l'erreur dans la modale
       if (err.message === 'TIMEOUT_WRITE' || err.message?.includes('fetch')) {
-        setFormError("Connexion trop lente. Vérifiez votre réseau.")
+        setFormError("La connexion ne répond pas malgré les tentatives.")
       } else {
         setFormError(err.message || 'Une erreur est survenue.')
       }
-      // On ne ferme PAS la modale en cas d'erreur, pour laisser l'utilisateur réessayer
     } finally {
-      // 4. QUOI QU'IL ARRIVE : On débloque le bouton
       setIsSubmitting(false)
     }
   }
@@ -283,31 +297,22 @@ export default function Tasks() {
     const oldStatus = task.status
     const newStatus = task.status === 'completed' ? 'pending' : 'completed'
     setTasks(current => current.map(t => t.id === task.id ? { ...t, status: newStatus } : t))
-    
     const completedAt = newStatus === 'completed' ? new Date().toISOString() : null
-
     const { error } = await supabase.from('tasks').update({ 
         status: newStatus, completed_at: completedAt
       }).eq('id', task.id)
-
-    if (error) {
-      setTasks(current => current.map(t => t.id === task.id ? { ...t, status: oldStatus } : t))
-    } else {
-       if (filter !== 'all') reloadTasks()
-    }
+    if (error) setTasks(current => current.map(t => t.id === task.id ? { ...t, status: oldStatus } : t))
+    else if (filter !== 'all') reloadTasks()
   }
 
   const handleDeleteTask = async (taskId: string) => {
     if (!confirm('Supprimer cette tâche ?')) return
     const previousTasks = [...tasks]
     setTasks(current => current.filter(t => t.id !== taskId))
-
     try {
       const { error } = await supabase.from('tasks').delete().eq('id', taskId)
       if (error) throw error
-    } catch (error) {
-      setTasks(previousTasks)
-    }
+    } catch (error) { setTasks(previousTasks) }
   }
 
   const getCategoryStyle = (category: string) => {
@@ -450,9 +455,18 @@ export default function Tasks() {
             </div>
 
             {formError && (
-              <div className="mx-6 mt-4 p-4 bg-red-50 border border-red-200 rounded-lg flex items-start gap-3">
-                <AlertCircle className="w-5 h-5 text-red-600 flex-shrink-0 mt-0.5" />
-                <div><h4 className="text-sm font-medium text-red-800">Erreur</h4><p className="text-sm text-red-600 mt-1">{formError}</p></div>
+              <div className="mx-6 mt-4 p-4 bg-red-50 border border-red-200 rounded-lg flex flex-col gap-2">
+                <div className="flex items-start gap-3">
+                  <AlertCircle className="w-5 h-5 text-red-600 flex-shrink-0 mt-0.5" />
+                  <div><h4 className="text-sm font-medium text-red-800">Erreur</h4><p className="text-sm text-red-600 mt-1">{formError}</p></div>
+                </div>
+                {/* BOUTON SECOURS SI MEME LE RETRY ECHOUE */}
+                <button 
+                  onClick={() => window.location.reload()} 
+                  className="mt-2 text-sm text-blue-600 font-medium hover:underline flex items-center gap-1 self-end"
+                >
+                  <RotateCcw className="w-4 h-4" /> Rafraîchir la page pour réparer
+                </button>
               </div>
             )}
 
