@@ -208,7 +208,7 @@ export default function Tasks() {
     await handleHardRefresh()
   }
 
-  // --- ARCHITECT FIX: SMART RETRY ---
+  // --- ARCHITECT FIX: SMART RETRY (CORRIGÉ) ---
   const handleCreateTask = async (e: React.FormEvent) => {
     e.preventDefault()
     setFormError(null)
@@ -220,10 +220,9 @@ export default function Tasks() {
       const hId = householdId || localStorage.getItem('homeflow_household_id')
       if (!hId) throw new Error('Famille introuvable. Rafraîchissez la page.')
 
-      // --- LE COEUR DU FIX : BOUCLE DE TENTATIVES (MAX 2) ---
       let attempt = 0;
       let success = false;
-      let lastError = null;
+      // J'ai supprimé la variable lastError qui posait problème
 
       while(attempt < 2 && !success) {
         attempt++;
@@ -250,20 +249,17 @@ export default function Tasks() {
           const result: any = await Promise.race([insertPromise, timeoutPromise])
           if (result.error) throw result.error
           
-          // Si on arrive ici, c'est gagné !
           success = true;
 
         } catch (err: any) {
           console.warn(`Echec tentative ${attempt}:`, err.message);
-          lastError = err;
           
           // Si c'est la 1ère tentative et que c'est un timeout, on attend un peu et on recommence
           if (attempt === 1 && (err.message === 'TIMEOUT_WRITE' || err.message?.includes('fetch'))) {
             await new Promise(resolve => setTimeout(resolve, 500)); // Pause 500ms
-            continue; // On repart pour un tour
+            continue; 
           }
-          
-          // Sinon (2ème échec ou autre erreur), on arrête
+          // Sinon on arrête
           throw err;
         }
       }
@@ -460,7 +456,6 @@ export default function Tasks() {
                   <AlertCircle className="w-5 h-5 text-red-600 flex-shrink-0 mt-0.5" />
                   <div><h4 className="text-sm font-medium text-red-800">Erreur</h4><p className="text-sm text-red-600 mt-1">{formError}</p></div>
                 </div>
-                {/* BOUTON SECOURS SI MEME LE RETRY ECHOUE */}
                 <button 
                   onClick={() => window.location.reload()} 
                   className="mt-2 text-sm text-blue-600 font-medium hover:underline flex items-center gap-1 self-end"
