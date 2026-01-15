@@ -16,10 +16,11 @@ import {
   Loader2,
   WifiOff,
   RefreshCw,
-  AlertTriangle
+  AlertTriangle,
+  AlertCircle // Nouvelle icône pour les erreurs de formulaire
 } from 'lucide-react'
 
-// --- Interfaces (Inchangées) ---
+// --- Interfaces ---
 interface Task {
   id: string
   title: string
@@ -70,7 +71,8 @@ export default function Tasks() {
   
   // UI States
   const [loading, setLoading] = useState(true)
-  const [error, setError] = useState<string | null>(null)
+  const [error, setError] = useState<string | null>(null) // Erreur globale (page)
+  const [formError, setFormError] = useState<string | null>(null) // Erreur locale (modal)
   const [showModal, setShowModal] = useState(false)
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [filter, setFilter] = useState<'all' | 'pending' | 'completed'>('pending')
@@ -88,25 +90,17 @@ export default function Tasks() {
     points: 10,
   })
 
-  // --- ARCHITECT FIX: NUCLEAR RESET ---
+  // --- NUCLEAR RESET (Déconnexion propre et totale) ---
   const handleHardRefresh = async () => {
     console.log("☢️ NUCLEAR RESET TRIGGERED")
-    // 1. On essaie de se déconnecter proprement si possible
     try { await supabase.auth.signOut() } catch (e) { /* ignore */ }
-    
-    // 2. On vide TOUT le stockage local (Supabase tokens, ID famille, tout)
-    localStorage.clear()
-    
-    // 3. On vide le state global
+    localStorage.clear() // Vide tout le cache
     setUser(null)
-    
-    // 4. On redirige vers le login (rechargement complet)
-    window.location.href = '/login'
+    window.location.href = '/login' // Force le rechargement navigateur
   }
 
   // --- INITIAL LOAD ---
   useEffect(() => {
-    // Check connexion internet immédiat
     if (!navigator.onLine) {
       setError("Vous êtes hors ligne. Vérifiez votre connexion internet.")
       setLoading(false)
@@ -115,7 +109,6 @@ export default function Tasks() {
 
     if (!hasLoadedData.current) {
       if (!user) {
-        // Si pas d'user au montage, on ne charge rien et on redirige/arrête
         setLoading(false)
         return
       }
@@ -140,7 +133,6 @@ export default function Tasks() {
 
     try {
       const fetchDataPromise = async () => {
-        // 1. Fetch Member & Household
         const { data: memberData, error: memberError } = await supabase
           .from('members')
           .select('household_id, households(id, name)')
@@ -156,7 +148,6 @@ export default function Tasks() {
         setHouseholdId(hId)
         localStorage.setItem('homeflow_household_id', hId)
 
-        // 2. Fetch Members
         const { data: membersData } = await supabase
           .from('members')
           .select('id, display_name')
@@ -164,11 +155,9 @@ export default function Tasks() {
         
         setMembers(membersData || [])
 
-        // 3. Fetch Tasks
         await loadTasksForHousehold(hId)
       }
 
-      // Timeout réduit à 7 secondes pour être plus réactif
       const timeoutPromise = new Promise((_, reject) => 
         setTimeout(() => reject(new Error('TIMEOUT_STARTUP')), 7000)
       )
@@ -178,11 +167,9 @@ export default function Tasks() {
 
     } catch (error: any) {
       console.error('Erreur chargement initial:', error)
-      
       if (error.message === 'TIMEOUT_STARTUP') {
         setError("Le serveur met trop de temps à répondre.")
       } else if (error.message === 'MEMBER_FETCH_ERROR') {
-        // Si on ne trouve pas le membre, c'est que le compte est peut-être désynchrone
         setError("Impossible de récupérer votre profil.")
       } else {
         setError("Erreur de connexion aux données.")
@@ -209,8 +196,6 @@ export default function Tasks() {
       setTasks(tasksData || [])
     } catch (error) {
       console.error('Erreur chargement tâches:', error)
-      // On ne bloque pas tout pour une erreur de chargement de liste
-      // Mais on pourrait afficher un toast discret
     }
   }
 
@@ -220,12 +205,16 @@ export default function Tasks() {
   }
 
   const handleLogout = async () => {
-    await handleHardRefresh() // On utilise la méthode radicale pour le logout aussi
+    await handleHardRefresh()
   }
 
-  // --- CREATE TASK ---
+  // --- CREATE TASK FIX ---
   const handleCreateTask = async (e: React.FormEvent) => {
     e.preventDefault()
+    
+    // Reset error state
+    setFormError(null)
+    
     if (isSubmitting) return
     setIsSubmitting(true)
 
@@ -246,7 +235,7 @@ export default function Tasks() {
         status: 'pending',
       })
 
-      // Timeout 5s pour l'écriture
+      // Timeout 5s
       const timeoutPromise = new Promise((_, reject) => 
         setTimeout(() => reject(new Error('TIMEOUT_WRITE')), 5000)
       )
@@ -265,24 +254,31 @@ export default function Tasks() {
         points: 10,
       })
 
-      await loadTasksForHousehold(hId)
+      // On recharge les tâches mais on n'attend pas forcément que ça finisse pour fermer la modale
+      // si la connexion est lente, au moins l'UI est débloquée
+      loadTasksForHousehold(hId)
       setShowModal(false)
 
     } catch (err: any) {
       console.error('Erreur création:', err)
+      
+      // ICI LA CORRECTION : On ne met PAS d'alert() bloquant.
+      // On affiche l'erreur dans la modale et on arrête le spinner.
+      
       if (err.message === 'TIMEOUT_WRITE' || err.message?.includes('fetch')) {
-        // En cas de timeout à l'écriture, on ne bloque pas, on informe
-        alert("La connexion est instable. La tâche n'a peut-être pas été sauvegardée. Veuillez vérifier votre connexion.")
+        setFormError("La connexion est instable. Veuillez vérifier votre réseau et réessayer.")
       } else {
-        alert(err.message || 'Erreur inconnue')
+        setFormError(err.message || 'Une erreur est survenue.')
       }
+      
+      // On force l'arrêt du spinner pour que tu puisses recliquer
+      setIsSubmitting(false) 
     } finally {
       setIsSubmitting(false)
     }
   }
 
   const handleToggleComplete = async (task: Task) => {
-    // Optimistic Update
     const oldStatus = task.status
     const newStatus = task.status === 'completed' ? 'pending' : 'completed'
     setTasks(current => current.map(t => t.id === task.id ? { ...t, status: newStatus } : t))
@@ -294,9 +290,7 @@ export default function Tasks() {
       }).eq('id', task.id)
 
     if (error) {
-      // Rollback en cas d'erreur
       setTasks(current => current.map(t => t.id === task.id ? { ...t, status: oldStatus } : t))
-      alert("Erreur de synchronisation")
     } else {
        if (filter !== 'all') reloadTasks()
     }
@@ -304,8 +298,6 @@ export default function Tasks() {
 
   const handleDeleteTask = async (taskId: string) => {
     if (!confirm('Supprimer cette tâche ?')) return
-    
-    // Optimistic Delete
     const previousTasks = [...tasks]
     setTasks(current => current.filter(t => t.id !== taskId))
 
@@ -313,9 +305,7 @@ export default function Tasks() {
       const { error } = await supabase.from('tasks').delete().eq('id', taskId)
       if (error) throw error
     } catch (error) {
-      // Rollback
       setTasks(previousTasks)
-      alert("Impossible de supprimer la tâche (Problème connexion)")
     }
   }
 
@@ -339,13 +329,13 @@ export default function Tasks() {
     )
   }
 
-  // ÉCRAN D'ERREUR CRITIQUE (Celui qui posait problème)
+  // ÉCRAN D'ERREUR CRITIQUE (Page entière)
   if (error) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-gray-50 px-4">
         <div className="text-center max-w-md w-full bg-white p-8 rounded-2xl shadow-lg border border-red-100">
           <WifiOff className="h-16 w-16 text-red-500 mx-auto mb-4" />
-          <h2 className="text-xl font-bold text-gray-900 mb-2">Connexion interrompue</h2>
+          <h2 className="text-xl font-bold text-gray-900 mb-2">Problème de connexion</h2>
           <p className="text-gray-600 mb-6">{error}</p>
           
           <div className="space-y-3">
@@ -356,19 +346,14 @@ export default function Tasks() {
               <RefreshCw className="w-5 h-5" />
               Réessayer
             </button>
-            
             <button 
               onClick={handleHardRefresh}
               className="w-full py-3 bg-white border border-red-200 text-red-600 rounded-xl hover:bg-red-50 transition font-medium flex items-center justify-center gap-2"
             >
               <AlertTriangle className="w-5 h-5" />
-              Déconnexion complète (Reset)
+              Déconnexion & Reset Cache
             </button>
           </div>
-          
-          <p className="text-xs text-gray-400 mt-6">
-            Utilisez "Déconnexion complète" si le problème persiste. Cela nettoiera le cache de l'application.
-          </p>
         </div>
       </div>
     )
@@ -376,7 +361,6 @@ export default function Tasks() {
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-50">
-      {/* Navigation */}
       <nav className="bg-white shadow-sm border-b">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
           <div className="flex justify-between items-center h-16">
@@ -407,7 +391,7 @@ export default function Tasks() {
             <p className="text-gray-600">{pendingCount} en cours • {completedCount} complétées</p>
           </div>
           <button
-            onClick={() => setShowModal(true)}
+            onClick={() => { setFormError(null); setShowModal(true); }}
             className="flex items-center px-6 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition font-medium shadow-lg hover:shadow-xl"
           >
             <Plus className="w-5 h-5 mr-2" />
@@ -415,7 +399,7 @@ export default function Tasks() {
           </button>
         </div>
 
-        {/* FILTRES (Raccourcis pour lisibilité, fonctionne comme avant) */}
+        {/* --- FILTRES --- */}
         <div className="bg-white rounded-xl shadow-sm p-4 mb-6 border border-gray-100">
           <div className="flex flex-wrap gap-4 items-center">
             <div className="flex items-center gap-2">
@@ -437,7 +421,7 @@ export default function Tasks() {
           </div>
         </div>
 
-        {/* LISTE DES TÂCHES */}
+        {/* --- LISTE DES TÂCHES --- */}
         <div className="space-y-3">
           {tasks.length === 0 ? (
             <div className="bg-white rounded-xl shadow-sm p-12 text-center border border-gray-100">
@@ -476,7 +460,7 @@ export default function Tasks() {
         </div>
       </main>
 
-      {/* MODAL */}
+      {/* --- MODAL (Avec gestion d'erreur intégrée) --- */}
       {showModal && (
         <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4 z-50">
           <div className="bg-white rounded-2xl shadow-2xl max-w-2xl w-full max-h-[90vh] overflow-y-auto">
@@ -484,6 +468,18 @@ export default function Tasks() {
               <h3 className="text-2xl font-bold text-gray-900">Créer une tâche</h3>
               <button onClick={() => setShowModal(false)} className="p-2 hover:bg-gray-100 rounded-lg transition" disabled={isSubmitting}><X className="w-5 h-5" /></button>
             </div>
+
+            {/* ERROR BANNER DANS LE MODAL (Non-bloquant) */}
+            {formError && (
+              <div className="mx-6 mt-4 p-4 bg-red-50 border border-red-200 rounded-lg flex items-start gap-3">
+                <AlertCircle className="w-5 h-5 text-red-600 flex-shrink-0 mt-0.5" />
+                <div>
+                  <h4 className="text-sm font-medium text-red-800">Erreur</h4>
+                  <p className="text-sm text-red-600 mt-1">{formError}</p>
+                </div>
+              </div>
+            )}
+
             <form onSubmit={handleCreateTask} className="p-6 space-y-6">
               <div>
                 <label className="block text-sm font-medium text-gray-700 mb-2">Titre de la tâche *</label>
