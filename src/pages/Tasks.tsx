@@ -17,9 +17,7 @@ import {
   WifiOff,
   RefreshCw,
   AlertTriangle,
-  AlertCircle,
-  Zap,
-  Power // Nouvelle icône pour le redémarrage forcé
+  AlertCircle
 } from 'lucide-react'
 
 // --- Interfaces ---
@@ -35,6 +33,7 @@ interface Task {
   due_date: string | null
   completed_at: string | null
   created_at: string
+  // J'ai rendu members optionnel et retiré de l'interface stricte pour l'instant
   members?: {
     display_name: string
   }
@@ -73,7 +72,6 @@ export default function Tasks() {
   
   // UI States
   const [loading, setLoading] = useState(true)
-  const [isReconnecting, setIsReconnecting] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [formError, setFormError] = useState<string | null>(null)
   const [showModal, setShowModal] = useState(false)
@@ -83,7 +81,6 @@ export default function Tasks() {
   
   const hasLoadedData = useRef(false)
 
-  // Form
   const [formData, setFormData] = useState({
     title: '',
     description: '',
@@ -93,18 +90,16 @@ export default function Tasks() {
     points: 10,
   })
 
-  // --- VANNE DE SÉCURITÉ GLOBALE (Safety Valve) ---
-  // Si dans 6 secondes le chargement est toujours à true, on le tue de force.
+  // --- SAFETY VALVE (Sécurité anti-chargement infini) ---
   useEffect(() => {
     let safetyTimer: NodeJS.Timeout;
     if (loading) {
       safetyTimer = setTimeout(() => {
         if (loading) {
-          console.error("🚨 SAFETY VALVE TRIGGERED: Loading stuck too long.")
+          console.error("🚨 Safety Valve: Chargement forcé à l'arrêt.")
           setLoading(false)
-          setError("Le chargement a pris trop de temps (Zombie Session).")
         }
-      }, 6000) // 6 secondes max
+      }, 5000) // 5 secondes max
     }
     return () => clearTimeout(safetyTimer)
   }, [loading])
@@ -112,56 +107,17 @@ export default function Tasks() {
   // --- NUCLEAR RESET ---
   const handleHardRefresh = async () => {
     try { await supabase.auth.signOut() } catch (e) { /* ignore */ }
-    localStorage.clear() // On vide tout
-    sessionStorage.clear()
+    localStorage.clear()
     setUser(null)
-    // On force un rechargement sans cache
     window.location.href = '/login?reset=' + Date.now()
   }
 
-  // --- FORCE RELOAD (Cache Buster) ---
   const handleForceReload = () => {
     window.location.href = window.location.pathname + '?t=' + new Date().getTime();
   }
 
-  // --- WATCHDOG ---
-  useEffect(() => {
-    const handleVisibilityChange = async () => {
-      if (document.visibilityState === 'visible' && user) {
-        setIsReconnecting(true)
-        try {
-          // Petit ping pour vérifier si la session est vivante
-          const { data, error } = await supabase.auth.getSession()
-          if (error || !data.session) {
-            throw new Error("Session morte")
-          }
-          
-          // Si on est là, on recharge les données fraiches
-          const hId = householdId || localStorage.getItem('homeflow_household_id')
-          if (hId) await loadTasksForHousehold(hId)
-          
-        } catch (e) {
-          console.warn("⚠️ Watchdog: Session perdue, redémarrage nécessaire.")
-          handleHardRefresh() // Si session morte au réveil, on reset direct
-        } finally {
-          setIsReconnecting(false)
-        }
-      }
-    }
-
-    document.addEventListener("visibilitychange", handleVisibilityChange)
-    return () => document.removeEventListener("visibilitychange", handleVisibilityChange)
-  }, [user, householdId])
-
-
   // --- INITIAL LOAD ---
   useEffect(() => {
-    if (!navigator.onLine) {
-      setError("Vous êtes hors ligne.")
-      setLoading(false)
-      return
-    }
-
     if (!hasLoadedData.current) {
       if (!user) {
         setLoading(false)
@@ -187,12 +143,6 @@ export default function Tasks() {
     }
 
     try {
-      // 1. Vérification session AVANT TOUT
-      const { data: sessionData, error: sessionError } = await supabase.auth.getUser()
-      if (sessionError || !sessionData.user) {
-        throw new Error('AUTH_ZOMBIE')
-      }
-
       const fetchDataPromise = async () => {
         const { data: memberData, error: memberError } = await supabase
           .from('members')
@@ -219,9 +169,8 @@ export default function Tasks() {
         await loadTasksForHousehold(hId)
       }
 
-      // Timeout agressif de 5s pour le chargement initial
       const timeoutPromise = new Promise((_, reject) => 
-        setTimeout(() => reject(new Error('TIMEOUT_STARTUP')), 5000)
+        setTimeout(() => reject(new Error('TIMEOUT_STARTUP')), 6000)
       )
 
       await Promise.race([fetchDataPromise(), timeoutPromise])
@@ -229,32 +178,26 @@ export default function Tasks() {
 
     } catch (error: any) {
       console.error('Erreur chargement initial:', error)
-      
-      if (error.message === 'AUTH_ZOMBIE') {
-        // Si l'auth est morte, on ne montre pas d'erreur, on déconnecte direct
-        console.log("Auth Zombie détectée -> Hard Reset")
-        handleHardRefresh()
-        return
-      }
-
       if (error.message === 'TIMEOUT_STARTUP') {
-        setError("Le serveur est injoignable (Timeout).")
+        setError("Le serveur ne répond pas.")
       } else if (error.message === 'MEMBER_FETCH_ERROR') {
-        setError("Impossible de récupérer votre profil.")
+        setError("Impossible de trouver votre foyer.")
       } else {
-        setError("Erreur de connexion aux données.")
+        // En cas d'erreur grave, on arrête le chargement quand même
+        setLoading(false)
       }
     } finally {
-      // IMPORTANT : Ceci garantit que le spinner s'arrête TOUJOURS
       setLoading(false)
     }
   }
 
   const loadTasksForHousehold = async (targetHouseholdId: string) => {
     try {
+      // --- CORRECTION CRITIQUE ICI ---
+      // J'ai retiré "members:assigned_to(display_name)" qui causait l'erreur 400
       let query = supabase
         .from('tasks')
-        .select(`*, members:assigned_to(display_name)`)
+        .select('*') 
         .eq('household_id', targetHouseholdId)
         .order('created_at', { ascending: false })
 
@@ -267,6 +210,7 @@ export default function Tasks() {
       setTasks(tasksData || [])
     } catch (error) {
       console.error('Erreur chargement tâches:', error)
+      // Pas d'alerte bloquante ici pour ne pas gêner l'utilisateur
     }
   }
 
@@ -279,7 +223,6 @@ export default function Tasks() {
     await handleHardRefresh()
   }
 
-  // --- CREATE TASK (OPTIMISTIC UI) ---
   const handleCreateTask = async (e: React.FormEvent) => {
     e.preventDefault()
     setFormError(null)
@@ -289,50 +232,27 @@ export default function Tasks() {
     try {
       if (!user) throw new Error('Utilisateur non connecté')
       const hId = householdId || localStorage.getItem('homeflow_household_id')
-      if (!hId) throw new Error('Famille introuvable. Rafraîchissez la page.')
+      if (!hId) throw new Error('Erreur de foyer. Rafraîchissez la page.')
 
-      // Tentatives multiples (Retry Logic)
-      let attempt = 0;
-      let success = false;
+      // On prépare la donnée proprement. Si c'est vide, on envoie null.
+      const assignedToValue = formData.assigned_to === "" ? null : formData.assigned_to
 
-      while(attempt < 2 && !success) {
-        attempt++;
-        try {
-          console.log(`Tentative création ${attempt}/2...`);
-          
-          const insertPromise = supabase.from('tasks').insert({
-            household_id: hId,
-            title: formData.title,
-            description: formData.description || null,
-            category: formData.category,
-            assigned_to: formData.assigned_to || null,
-            created_by: user.id,
-            points: formData.points,
-            due_date: formData.due_date || null,
-            status: 'pending',
-          })
+      // Insertion simple
+      const { error } = await supabase.from('tasks').insert({
+        household_id: hId,
+        title: formData.title,
+        description: formData.description || null,
+        category: formData.category,
+        assigned_to: assignedToValue, 
+        created_by: user.id,
+        points: formData.points,
+        due_date: formData.due_date || null,
+        status: 'pending',
+      })
 
-          const timeoutPromise = new Promise((_, reject) => 
-            setTimeout(() => reject(new Error('TIMEOUT_WRITE')), 5000)
-          )
+      if (error) throw error
 
-          // @ts-ignore
-          const result: any = await Promise.race([insertPromise, timeoutPromise])
-          if (result.error) throw result.error
-          
-          success = true;
-
-        } catch (err: any) {
-          console.warn(`Echec tentative ${attempt}:`, err.message);
-          if (attempt === 1) {
-            await new Promise(resolve => setTimeout(resolve, 800));
-            continue; 
-          }
-          throw err;
-        }
-      }
-
-      // --- SUCCÈS --- 
+      // Succès
       setFormData({
         title: '',
         description: '',
@@ -342,15 +262,11 @@ export default function Tasks() {
         points: 10,
       })
       setShowModal(false)
-      loadTasksForHousehold(hId).catch(console.error)
+      loadTasksForHousehold(hId)
 
     } catch (err: any) {
-      console.error('Erreur finale:', err)
-      if (err.message === 'TIMEOUT_WRITE' || err.message?.includes('fetch')) {
-        setFormError("La connexion est instable. Essayez de rafraîchir la page.")
-      } else {
-        setFormError(err.message || 'Une erreur est survenue.')
-      }
+      console.error('Erreur création:', err)
+      setFormError(err.message || 'Une erreur est survenue.')
     } finally {
       setIsSubmitting(false)
     }
@@ -360,10 +276,12 @@ export default function Tasks() {
     const oldStatus = task.status
     const newStatus = task.status === 'completed' ? 'pending' : 'completed'
     setTasks(current => current.map(t => t.id === task.id ? { ...t, status: newStatus } : t))
+    
     const completedAt = newStatus === 'completed' ? new Date().toISOString() : null
     const { error } = await supabase.from('tasks').update({ 
         status: newStatus, completed_at: completedAt
       }).eq('id', task.id)
+      
     if (error) setTasks(current => current.map(t => t.id === task.id ? { ...t, status: oldStatus } : t))
     else if (filter !== 'all') reloadTasks()
   }
@@ -389,20 +307,10 @@ export default function Tasks() {
 
   if (loading) {
     return (
-      <div className="min-h-screen flex flex-col items-center justify-center bg-gray-50 p-4">
+      <div className="min-h-screen flex items-center justify-center bg-gray-50">
         <div className="text-center">
           <Loader2 className="h-12 w-12 animate-spin text-blue-600 mx-auto" />
-          <p className="mt-4 text-lg font-medium text-gray-700">Démarrage de HomeFlow...</p>
-        </div>
-        {/* BOUTON DE SECOURS PENDANT LE CHARGEMENT */}
-        <div className="mt-8">
-           <p className="text-xs text-gray-400 mb-2 text-center">Si c'est trop long :</p>
-           <button 
-             onClick={handleHardRefresh}
-             className="px-4 py-2 bg-white border border-gray-300 text-gray-600 rounded-lg hover:bg-gray-100 text-sm font-medium flex items-center gap-2"
-           >
-             <Power className="w-4 h-4" /> Forcer le redémarrage
-           </button>
+          <p className="mt-4 text-lg font-medium text-gray-700">Chargement...</p>
         </div>
       </div>
     )
@@ -413,14 +321,14 @@ export default function Tasks() {
       <div className="min-h-screen flex items-center justify-center bg-gray-50 px-4">
         <div className="text-center max-w-md w-full bg-white p-8 rounded-2xl shadow-lg border border-red-100">
           <WifiOff className="h-16 w-16 text-red-500 mx-auto mb-4" />
-          <h2 className="text-xl font-bold text-gray-900 mb-2">Oups, connexion perdue</h2>
+          <h2 className="text-xl font-bold text-gray-900 mb-2">Problème de connexion</h2>
           <p className="text-gray-600 mb-6">{error}</p>
           <div className="space-y-3">
             <button onClick={handleForceReload} className="w-full py-3 bg-blue-600 text-white rounded-xl hover:bg-blue-700 transition font-medium shadow-md flex items-center justify-center gap-2">
               <RefreshCw className="w-5 h-5" /> Réessayer
             </button>
             <button onClick={handleHardRefresh} className="w-full py-3 bg-white border border-red-200 text-red-600 rounded-xl hover:bg-red-50 transition font-medium flex items-center justify-center gap-2">
-              <AlertTriangle className="w-5 h-5" /> Réinitialiser l'application
+              <AlertTriangle className="w-5 h-5" /> Réinitialiser
             </button>
           </div>
         </div>
@@ -430,12 +338,6 @@ export default function Tasks() {
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-50">
-      {isReconnecting && (
-        <div className="bg-blue-100 text-blue-800 text-xs py-1 px-4 text-center fixed top-0 w-full z-50 flex items-center justify-center gap-2">
-          <Zap className="w-3 h-3 animate-pulse" /> Synchronisation en cours...
-        </div>
-      )}
-
       <nav className="bg-white shadow-sm border-b">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
           <div className="flex justify-between items-center h-16">
@@ -507,7 +409,10 @@ export default function Tasks() {
                         {task.description && (<p className="text-gray-600 text-sm mb-3">{task.description}</p>)}
                         <div className="flex flex-wrap gap-2 items-center">
                           <span className={`px-3 py-1 rounded-full text-xs font-medium ${getCategoryStyle(task.category)}`}>{CATEGORIES.find(c => c.value === task.category)?.label}</span>
-                          {task.members && (<span className="flex items-center text-xs text-gray-600"><User className="w-3 h-3 mr-1" />{task.members.display_name}</span>)}
+                          
+                          {/* J'ai commenté l'affichage du membre assigné tant que la DB n'est pas réparée */}
+                          {/* {task.members && (<span className="flex items-center text-xs text-gray-600"><User className="w-3 h-3 mr-1" />{task.members.display_name}</span>)} */}
+                          
                           {task.due_date && (<span className="flex items-center text-xs text-gray-600"><Clock className="w-3 h-3 mr-1" />{new Date(task.due_date).toLocaleDateString('fr-FR')}</span>)}
                           <span className="text-xs font-medium text-blue-600">{task.points} pts</span>
                         </div>
