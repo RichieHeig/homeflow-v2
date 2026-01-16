@@ -18,7 +18,8 @@ import {
   RefreshCw,
   AlertTriangle,
   AlertCircle,
-  Zap // Nouvelle icône pour indiquer la reconnexion
+  Zap,
+  Power // Nouvelle icône pour le redémarrage forcé
 } from 'lucide-react'
 
 // --- Interfaces ---
@@ -72,7 +73,7 @@ export default function Tasks() {
   
   // UI States
   const [loading, setLoading] = useState(true)
-  const [isReconnecting, setIsReconnecting] = useState(false) // Nouvel état pour le Watchdog
+  const [isReconnecting, setIsReconnecting] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [formError, setFormError] = useState<string | null>(null)
   const [showModal, setShowModal] = useState(false)
@@ -92,43 +93,56 @@ export default function Tasks() {
     points: 10,
   })
 
-  // --- FORCE RELOAD (Cache Buster) ---
-  // C'est ça qui répare le bouton "Réessayer" qui tournait dans le vide
-  const handleForceReload = () => {
-    // On ajoute un timestamp pour forcer le navigateur à ignorer le cache
-    window.location.href = window.location.pathname + '?t=' + new Date().getTime();
-  }
+  // --- VANNE DE SÉCURITÉ GLOBALE (Safety Valve) ---
+  // Si dans 6 secondes le chargement est toujours à true, on le tue de force.
+  useEffect(() => {
+    let safetyTimer: NodeJS.Timeout;
+    if (loading) {
+      safetyTimer = setTimeout(() => {
+        if (loading) {
+          console.error("🚨 SAFETY VALVE TRIGGERED: Loading stuck too long.")
+          setLoading(false)
+          setError("Le chargement a pris trop de temps (Zombie Session).")
+        }
+      }, 6000) // 6 secondes max
+    }
+    return () => clearTimeout(safetyTimer)
+  }, [loading])
 
   // --- NUCLEAR RESET ---
   const handleHardRefresh = async () => {
     try { await supabase.auth.signOut() } catch (e) { /* ignore */ }
-    localStorage.clear()
+    localStorage.clear() // On vide tout
+    sessionStorage.clear()
     setUser(null)
-    window.location.href = '/login'
+    // On force un rechargement sans cache
+    window.location.href = '/login?reset=' + Date.now()
   }
 
-  // --- WATCHDOG (CHIEN DE GARDE) ---
-  // C'est lui qui détecte quand tu reviens de ta capture d'écran
+  // --- FORCE RELOAD (Cache Buster) ---
+  const handleForceReload = () => {
+    window.location.href = window.location.pathname + '?t=' + new Date().getTime();
+  }
+
+  // --- WATCHDOG ---
   useEffect(() => {
     const handleVisibilityChange = async () => {
       if (document.visibilityState === 'visible' && user) {
-        console.log("👀 L'utilisateur est revenu ! Vérification de la connexion...")
         setIsReconnecting(true)
-        
         try {
-          // On tente un petit ping léger (récupérer le profil)
-          const { error } = await supabase.from('members').select('id').eq('id', user.id).single()
-          
-          if (error) {
-            console.warn("⚠️ Connexion perdue pendant la veille. Rechargement des données...")
-            // Si le ping échoue, on recharge tout proprement
-            const hId = householdId || localStorage.getItem('homeflow_household_id')
-            if (hId) await loadTasksForHousehold(hId)
-          } else {
-            console.log("✅ Connexion toujours active.")
+          // Petit ping pour vérifier si la session est vivante
+          const { data, error } = await supabase.auth.getSession()
+          if (error || !data.session) {
+            throw new Error("Session morte")
           }
+          
+          // Si on est là, on recharge les données fraiches
+          const hId = householdId || localStorage.getItem('homeflow_household_id')
+          if (hId) await loadTasksForHousehold(hId)
+          
         } catch (e) {
-          console.error("Erreur Watchdog:", e)
+          console.warn("⚠️ Watchdog: Session perdue, redémarrage nécessaire.")
+          handleHardRefresh() // Si session morte au réveil, on reset direct
         } finally {
           setIsReconnecting(false)
         }
@@ -136,19 +150,14 @@ export default function Tasks() {
     }
 
     document.addEventListener("visibilitychange", handleVisibilityChange)
-    window.addEventListener("focus", handleVisibilityChange) // Double sécurité
-
-    return () => {
-      document.removeEventListener("visibilitychange", handleVisibilityChange)
-      window.removeEventListener("focus", handleVisibilityChange)
-    }
+    return () => document.removeEventListener("visibilitychange", handleVisibilityChange)
   }, [user, householdId])
 
 
   // --- INITIAL LOAD ---
   useEffect(() => {
     if (!navigator.onLine) {
-      setError("Vous êtes hors ligne. Vérifiez votre connexion internet.")
+      setError("Vous êtes hors ligne.")
       setLoading(false)
       return
     }
@@ -178,6 +187,12 @@ export default function Tasks() {
     }
 
     try {
+      // 1. Vérification session AVANT TOUT
+      const { data: sessionData, error: sessionError } = await supabase.auth.getUser()
+      if (sessionError || !sessionData.user) {
+        throw new Error('AUTH_ZOMBIE')
+      }
+
       const fetchDataPromise = async () => {
         const { data: memberData, error: memberError } = await supabase
           .from('members')
@@ -204,8 +219,9 @@ export default function Tasks() {
         await loadTasksForHousehold(hId)
       }
 
+      // Timeout agressif de 5s pour le chargement initial
       const timeoutPromise = new Promise((_, reject) => 
-        setTimeout(() => reject(new Error('TIMEOUT_STARTUP')), 8000) // 8s timeout
+        setTimeout(() => reject(new Error('TIMEOUT_STARTUP')), 5000)
       )
 
       await Promise.race([fetchDataPromise(), timeoutPromise])
@@ -213,14 +229,23 @@ export default function Tasks() {
 
     } catch (error: any) {
       console.error('Erreur chargement initial:', error)
+      
+      if (error.message === 'AUTH_ZOMBIE') {
+        // Si l'auth est morte, on ne montre pas d'erreur, on déconnecte direct
+        console.log("Auth Zombie détectée -> Hard Reset")
+        handleHardRefresh()
+        return
+      }
+
       if (error.message === 'TIMEOUT_STARTUP') {
-        setError("Le serveur met trop de temps à répondre.")
+        setError("Le serveur est injoignable (Timeout).")
       } else if (error.message === 'MEMBER_FETCH_ERROR') {
         setError("Impossible de récupérer votre profil.")
       } else {
         setError("Erreur de connexion aux données.")
       }
     } finally {
+      // IMPORTANT : Ceci garantit que le spinner s'arrête TOUJOURS
       setLoading(false)
     }
   }
@@ -254,7 +279,7 @@ export default function Tasks() {
     await handleHardRefresh()
   }
 
-  // --- SMART CREATE TASK ---
+  // --- CREATE TASK (OPTIMISTIC UI) ---
   const handleCreateTask = async (e: React.FormEvent) => {
     e.preventDefault()
     setFormError(null)
@@ -300,7 +325,7 @@ export default function Tasks() {
         } catch (err: any) {
           console.warn(`Echec tentative ${attempt}:`, err.message);
           if (attempt === 1) {
-            await new Promise(resolve => setTimeout(resolve, 800)); // Pause plus longue (800ms)
+            await new Promise(resolve => setTimeout(resolve, 800));
             continue; 
           }
           throw err;
@@ -364,10 +389,20 @@ export default function Tasks() {
 
   if (loading) {
     return (
-      <div className="min-h-screen flex items-center justify-center bg-gray-50">
+      <div className="min-h-screen flex flex-col items-center justify-center bg-gray-50 p-4">
         <div className="text-center">
           <Loader2 className="h-12 w-12 animate-spin text-blue-600 mx-auto" />
-          <p className="mt-4 text-lg font-medium text-gray-700">Chargement...</p>
+          <p className="mt-4 text-lg font-medium text-gray-700">Démarrage de HomeFlow...</p>
+        </div>
+        {/* BOUTON DE SECOURS PENDANT LE CHARGEMENT */}
+        <div className="mt-8">
+           <p className="text-xs text-gray-400 mb-2 text-center">Si c'est trop long :</p>
+           <button 
+             onClick={handleHardRefresh}
+             className="px-4 py-2 bg-white border border-gray-300 text-gray-600 rounded-lg hover:bg-gray-100 text-sm font-medium flex items-center gap-2"
+           >
+             <Power className="w-4 h-4" /> Forcer le redémarrage
+           </button>
         </div>
       </div>
     )
@@ -378,14 +413,14 @@ export default function Tasks() {
       <div className="min-h-screen flex items-center justify-center bg-gray-50 px-4">
         <div className="text-center max-w-md w-full bg-white p-8 rounded-2xl shadow-lg border border-red-100">
           <WifiOff className="h-16 w-16 text-red-500 mx-auto mb-4" />
-          <h2 className="text-xl font-bold text-gray-900 mb-2">Problème de connexion</h2>
+          <h2 className="text-xl font-bold text-gray-900 mb-2">Oups, connexion perdue</h2>
           <p className="text-gray-600 mb-6">{error}</p>
           <div className="space-y-3">
             <button onClick={handleForceReload} className="w-full py-3 bg-blue-600 text-white rounded-xl hover:bg-blue-700 transition font-medium shadow-md flex items-center justify-center gap-2">
               <RefreshCw className="w-5 h-5" /> Réessayer
             </button>
             <button onClick={handleHardRefresh} className="w-full py-3 bg-white border border-red-200 text-red-600 rounded-xl hover:bg-red-50 transition font-medium flex items-center justify-center gap-2">
-              <AlertTriangle className="w-5 h-5" /> Déconnexion & Reset
+              <AlertTriangle className="w-5 h-5" /> Réinitialiser l'application
             </button>
           </div>
         </div>
@@ -395,10 +430,9 @@ export default function Tasks() {
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-50">
-      {/* Petit indicateur de reconnexion discret en haut */}
       {isReconnecting && (
-        <div className="bg-yellow-100 text-yellow-800 text-xs py-1 px-4 text-center fixed top-0 w-full z-50 flex items-center justify-center gap-2">
-          <Zap className="w-3 h-3 animate-pulse" /> Rétablissement de la connexion...
+        <div className="bg-blue-100 text-blue-800 text-xs py-1 px-4 text-center fixed top-0 w-full z-50 flex items-center justify-center gap-2">
+          <Zap className="w-3 h-3 animate-pulse" /> Synchronisation en cours...
         </div>
       )}
 
@@ -505,12 +539,6 @@ export default function Tasks() {
                   <AlertCircle className="w-5 h-5 text-red-600 flex-shrink-0 mt-0.5" />
                   <div><h4 className="text-sm font-medium text-red-800">Erreur</h4><p className="text-sm text-red-600 mt-1">{formError}</p></div>
                 </div>
-                <button 
-                  onClick={handleForceReload} 
-                  className="mt-2 text-sm text-blue-600 font-medium hover:underline flex items-center gap-1 self-end"
-                >
-                  <RefreshCw className="w-4 h-4" /> Rafraîchir la page pour réparer
-                </button>
               </div>
             )}
 
