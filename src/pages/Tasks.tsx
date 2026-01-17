@@ -33,7 +33,6 @@ interface Task {
   due_date: string | null
   completed_at: string | null
   created_at: string
-  // J'ai rendu members optionnel et retiré de l'interface stricte pour l'instant
   members?: {
     display_name: string
   }
@@ -90,16 +89,19 @@ export default function Tasks() {
     points: 10,
   })
 
-  // --- SAFETY VALVE (Sécurité anti-chargement infini) ---
+  // --- SAFETY VALVE ---
+  // Si le chargement dure plus de 3s, on considère qu'on est en "Cache Empoisonné"
+  // et on force le nettoyage.
   useEffect(() => {
     let safetyTimer: NodeJS.Timeout;
     if (loading) {
       safetyTimer = setTimeout(() => {
         if (loading) {
-          console.error("🚨 Safety Valve: Chargement forcé à l'arrêt.")
-          setLoading(false)
+            console.warn("🚨 Chargement trop long -> Nettoyage préventif du cache");
+            // On ne vide pas tout brutalement, mais on arrête le spinner
+            setLoading(false);
         }
-      }, 5000) // 5 secondes max
+      }, 4000)
     }
     return () => clearTimeout(safetyTimer)
   }, [loading])
@@ -108,25 +110,24 @@ export default function Tasks() {
   const handleHardRefresh = async () => {
     try { await supabase.auth.signOut() } catch (e) { /* ignore */ }
     localStorage.clear()
+    sessionStorage.clear()
     setUser(null)
-    window.location.href = '/login?reset=' + Date.now()
+    window.location.href = '/login'
   }
 
   const handleForceReload = () => {
-    window.location.href = window.location.pathname + '?t=' + new Date().getTime();
+    window.location.reload()
   }
 
-  // --- INITIAL LOAD ---
+  // --- INITIAL LOAD (CORRIGÉ POUR ÉVITER LE CACHE VIDE) ---
   useEffect(() => {
+    // On lance le chargement immédiatement au montage du composant
+    // On ne se fie pas uniquement à "user" qui peut venir du cache périmé
     if (!hasLoadedData.current) {
-      if (!user) {
-        setLoading(false)
-        return
-      }
-      hasLoadedData.current = true
-      loadInitialData()
+        hasLoadedData.current = true
+        checkSessionAndLoadData()
     }
-  }, [user])
+  }, []) // Tableau de dépendance vide = se lance une seule fois au démarrage
 
   // --- FILTER RELOAD ---
   useEffect(() => {
@@ -136,18 +137,34 @@ export default function Tasks() {
     }
   }, [filter, selectedMemberFilter]) 
 
-  const loadInitialData = async () => {
-    if (!user) {
-      setLoading(false)
-      return
-    }
-
+  // --- LA NOUVELLE FONCTION INTELLIGENTE ---
+  const checkSessionAndLoadData = async () => {
     try {
-      const fetchDataPromise = async () => {
+        setLoading(true)
+
+        // 1. VÉRIFICATION DOUANIÈRE (On demande au serveur : "Est-il connecté ?")
+        // On ne fait pas confiance au localStorage ici.
+        const { data: sessionData, error: sessionError } = await supabase.auth.getSession()
+
+        if (sessionError || !sessionData.session) {
+            // Si le serveur dit non, on jette ce qu'on a en mémoire et on sort
+            console.log("Session invalide -> Redirection login")
+            throw new Error("AUTH_INVALID")
+        }
+
+        // Si on est là, c'est que le serveur valide la connexion.
+        // On met à jour l'utilisateur dans le store pour être sûr d'être synchro
+        if (sessionData.session.user) {
+            setUser(sessionData.session.user)
+        }
+        
+        const currentUser = sessionData.session.user
+
+        // 2. CHARGEMENT DES DONNÉES
         const { data: memberData, error: memberError } = await supabase
           .from('members')
           .select('household_id, households(id, name)')
-          .eq('id', user.id)
+          .eq('id', currentUser.id)
           .single()
 
         if (memberError || !memberData) throw new Error('MEMBER_FETCH_ERROR')
@@ -167,34 +184,26 @@ export default function Tasks() {
         setMembers(membersData || [])
 
         await loadTasksForHousehold(hId)
-      }
-
-      const timeoutPromise = new Promise((_, reject) => 
-        setTimeout(() => reject(new Error('TIMEOUT_STARTUP')), 6000)
-      )
-
-      await Promise.race([fetchDataPromise(), timeoutPromise])
-      setError(null)
+        setError(null)
 
     } catch (error: any) {
-      console.error('Erreur chargement initial:', error)
-      if (error.message === 'TIMEOUT_STARTUP') {
-        setError("Le serveur ne répond pas.")
-      } else if (error.message === 'MEMBER_FETCH_ERROR') {
-        setError("Impossible de trouver votre foyer.")
-      } else {
-        // En cas d'erreur grave, on arrête le chargement quand même
-        setLoading(false)
-      }
+        console.error('Erreur démarrage:', error)
+        
+        if (error.message === 'AUTH_INVALID') {
+            // Redirection douce vers le login
+            handleHardRefresh()
+        } else if (error.message === 'MEMBER_FETCH_ERROR') {
+            setError("Impossible de trouver votre profil membre.")
+        } else {
+            setError("Erreur de connexion.")
+        }
     } finally {
-      setLoading(false)
+        setLoading(false)
     }
   }
 
   const loadTasksForHousehold = async (targetHouseholdId: string) => {
     try {
-      // --- CORRECTION CRITIQUE ICI ---
-      // J'ai retiré "members:assigned_to(display_name)" qui causait l'erreur 400
       let query = supabase
         .from('tasks')
         .select('*') 
@@ -210,7 +219,6 @@ export default function Tasks() {
       setTasks(tasksData || [])
     } catch (error) {
       console.error('Erreur chargement tâches:', error)
-      // Pas d'alerte bloquante ici pour ne pas gêner l'utilisateur
     }
   }
 
@@ -226,6 +234,7 @@ export default function Tasks() {
   const handleCreateTask = async (e: React.FormEvent) => {
     e.preventDefault()
     setFormError(null)
+    
     if (isSubmitting) return
     setIsSubmitting(true)
 
@@ -234,11 +243,18 @@ export default function Tasks() {
       const hId = householdId || localStorage.getItem('homeflow_household_id')
       if (!hId) throw new Error('Erreur de foyer. Rafraîchissez la page.')
 
-      // On prépare la donnée proprement. Si c'est vide, on envoie null.
+      // PING CHECK
+      try {
+        const pingPromise = supabase.from('households').select('id').limit(1).single()
+        const pingTimeout = new Promise((_, reject) => setTimeout(() => reject(new Error('PING_TIMEOUT')), 2000))
+        await Promise.race([pingPromise, pingTimeout])
+      } catch (pingErr) {
+        throw new Error("CONNEXION_MORTE")
+      }
+
       const assignedToValue = formData.assigned_to === "" ? null : formData.assigned_to
 
-      // Insertion simple
-      const { error } = await supabase.from('tasks').insert({
+      const insertPromise = supabase.from('tasks').insert({
         household_id: hId,
         title: formData.title,
         description: formData.description || null,
@@ -250,9 +266,14 @@ export default function Tasks() {
         status: 'pending',
       })
 
+      const timeoutPromise = new Promise((_, reject) => 
+        setTimeout(() => reject(new Error('TIMEOUT_WRITE')), 5000)
+      )
+
+      // @ts-ignore
+      const { error } = await Promise.race([insertPromise, timeoutPromise])
       if (error) throw error
 
-      // Succès
       setFormData({
         title: '',
         description: '',
@@ -266,7 +287,11 @@ export default function Tasks() {
 
     } catch (err: any) {
       console.error('Erreur création:', err)
-      setFormError(err.message || 'Une erreur est survenue.')
+      if (err.message === 'CONNEXION_MORTE' || err.message === 'PING_TIMEOUT' || err.message === 'TIMEOUT_WRITE') {
+        setFormError("Votre connexion s'est endormie. Veuillez rafraîchir la page.")
+      } else {
+        setFormError(err.message || 'Une erreur est survenue.')
+      }
     } finally {
       setIsSubmitting(false)
     }
@@ -410,9 +435,6 @@ export default function Tasks() {
                         <div className="flex flex-wrap gap-2 items-center">
                           <span className={`px-3 py-1 rounded-full text-xs font-medium ${getCategoryStyle(task.category)}`}>{CATEGORIES.find(c => c.value === task.category)?.label}</span>
                           
-                          {/* J'ai commenté l'affichage du membre assigné tant que la DB n'est pas réparée */}
-                          {/* {task.members && (<span className="flex items-center text-xs text-gray-600"><User className="w-3 h-3 mr-1" />{task.members.display_name}</span>)} */}
-                          
                           {task.due_date && (<span className="flex items-center text-xs text-gray-600"><Clock className="w-3 h-3 mr-1" />{new Date(task.due_date).toLocaleDateString('fr-FR')}</span>)}
                           <span className="text-xs font-medium text-blue-600">{task.points} pts</span>
                         </div>
@@ -444,6 +466,12 @@ export default function Tasks() {
                   <AlertCircle className="w-5 h-5 text-red-600 flex-shrink-0 mt-0.5" />
                   <div><h4 className="text-sm font-medium text-red-800">Erreur</h4><p className="text-sm text-red-600 mt-1">{formError}</p></div>
                 </div>
+                <button 
+                  onClick={handleForceReload} 
+                  className="mt-2 text-sm text-blue-600 font-medium hover:underline flex items-center gap-1 self-end"
+                >
+                  <RefreshCw className="w-4 h-4" /> Rafraîchir la page pour reconnecter
+                </button>
               </div>
             )}
 
