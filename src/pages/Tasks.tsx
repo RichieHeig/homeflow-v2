@@ -1,4 +1,4 @@
-import { useEffect, useState, useRef } from 'react'
+import { useEffect, useState, useRef, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { supabase } from '@/lib/supabase'
 import { useAuthStore } from '@/store/authStore'
@@ -79,6 +79,7 @@ export default function Tasks() {
   const [selectedMemberFilter, setSelectedMemberFilter] = useState<string | null>(null)
   
   const hasLoadedData = useRef(false)
+  const sessionCheckInterval = useRef<NodeJS.Timeout | null>(null)
 
   const [formData, setFormData] = useState({
     title: '',
@@ -89,45 +90,105 @@ export default function Tasks() {
     points: 10,
   })
 
-  // --- SAFETY VALVE ---
-  // Si le chargement dure plus de 3s, on considère qu'on est en "Cache Empoisonné"
-  // et on force le nettoyage.
-  useEffect(() => {
-    let safetyTimer: NodeJS.Timeout;
-    if (loading) {
-      safetyTimer = setTimeout(() => {
-        if (loading) {
-            console.warn("🚨 Chargement trop long -> Nettoyage préventif du cache");
-            // On ne vide pas tout brutalement, mais on arrête le spinner
-            setLoading(false);
-        }
-      }, 4000)
+  // --- HARD REFRESH (déconnexion complète) ---
+  const handleHardRefresh = useCallback(async () => {
+    // Nettoyer l'interval si actif
+    if (sessionCheckInterval.current) {
+      clearInterval(sessionCheckInterval.current)
     }
-    return () => clearTimeout(safetyTimer)
-  }, [loading])
-
-  // --- NUCLEAR RESET ---
-  const handleHardRefresh = async () => {
     try { await supabase.auth.signOut() } catch (e) { /* ignore */ }
     localStorage.clear()
     sessionStorage.clear()
     setUser(null)
     window.location.href = '/login'
-  }
+  }, [setUser])
 
   const handleForceReload = () => {
     window.location.reload()
   }
 
-  // --- INITIAL LOAD (CORRIGÉ POUR ÉVITER LE CACHE VIDE) ---
-  useEffect(() => {
-    // On lance le chargement immédiatement au montage du composant
-    // On ne se fie pas uniquement à "user" qui peut venir du cache périmé
-    if (!hasLoadedData.current) {
-        hasLoadedData.current = true
-        checkSessionAndLoadData()
+  // --- FONCTION UTILITAIRE : Vérifier et rafraîchir la session ---
+  const ensureValidSession = useCallback(async (): Promise<boolean> => {
+    try {
+      // Tenter de rafraîchir la session
+      const { data: { session }, error } = await supabase.auth.refreshSession()
+      
+      if (error || !session) {
+        console.warn('Session invalide ou expirée')
+        return false
+      }
+      
+      // Mettre à jour l'utilisateur dans le store
+      if (session.user) {
+        setUser(session.user)
+      }
+      
+      return true
+    } catch (err) {
+      console.error('Erreur refresh session:', err)
+      return false
     }
-  }, []) // Tableau de dépendance vide = se lance une seule fois au démarrage
+  }, [setUser])
+
+  // --- LISTENER POUR LES CHANGEMENTS D'AUTH ---
+  useEffect(() => {
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((event, session) => {
+      console.log('🔐 Auth event:', event)
+      
+      if (event === 'SIGNED_OUT') {
+        handleHardRefresh()
+      } else if (event === 'TOKEN_REFRESHED' && session) {
+        console.log('✅ Token rafraîchi automatiquement')
+        setUser(session.user)
+      } else if (event === 'USER_UPDATED' && session) {
+        setUser(session.user)
+      }
+    })
+    
+    return () => subscription.unsubscribe()
+  }, [handleHardRefresh, setUser])
+
+  // --- VÉRIFICATION PÉRIODIQUE DE LA SESSION (toutes les 2 minutes) ---
+  useEffect(() => {
+    // Vérifier la session toutes les 2 minutes pour éviter les déconnexions surprises
+    sessionCheckInterval.current = setInterval(async () => {
+      const isValid = await ensureValidSession()
+      if (!isValid) {
+        console.warn('🚨 Session expirée détectée lors du check périodique')
+        // On ne déconnecte pas automatiquement, mais on prépare le terrain
+        // La prochaine action de l'utilisateur déclenchera la reconnexion
+      }
+    }, 2 * 60 * 1000) // 2 minutes
+    
+    return () => {
+      if (sessionCheckInterval.current) {
+        clearInterval(sessionCheckInterval.current)
+      }
+    }
+  }, [ensureValidSession])
+
+  // --- SAFETY VALVE (timeout de chargement) ---
+  useEffect(() => {
+    let safetyTimer: NodeJS.Timeout
+    if (loading) {
+      safetyTimer = setTimeout(() => {
+        if (loading) {
+          console.warn("🚨 Chargement trop long -> Arrêt du spinner")
+          setLoading(false)
+          setError("Le chargement a pris trop de temps. Vérifiez votre connexion.")
+        }
+      }, 8000) // 8 secondes max
+    }
+    return () => clearTimeout(safetyTimer)
+  }, [loading])
+
+  // --- INITIAL LOAD ---
+  useEffect(() => {
+    if (!hasLoadedData.current) {
+      hasLoadedData.current = true
+      checkSessionAndLoadData()
+    }
+  }, [])
 
   // --- FILTER RELOAD ---
   useEffect(() => {
@@ -135,73 +196,75 @@ export default function Tasks() {
     if (hasLoadedData.current && safeHouseholdId && !loading && !error) {
       loadTasksForHousehold(safeHouseholdId)
     }
-  }, [filter, selectedMemberFilter]) 
+  }, [filter, selectedMemberFilter])
 
-  // --- LA NOUVELLE FONCTION INTELLIGENTE ---
+  // --- CHARGEMENT INITIAL DES DONNÉES ---
   const checkSessionAndLoadData = async () => {
     try {
-        setLoading(true)
+      setLoading(true)
+      setError(null)
 
-        // 1. VÉRIFICATION DOUANIÈRE (On demande au serveur : "Est-il connecté ?")
-        // On ne fait pas confiance au localStorage ici.
-        const { data: sessionData, error: sessionError } = await supabase.auth.getSession()
+      // 1. VÉRIFICATION DE LA SESSION
+      const { data: sessionData, error: sessionError } = await supabase.auth.getSession()
 
-        if (sessionError || !sessionData.session) {
-            // Si le serveur dit non, on jette ce qu'on a en mémoire et on sort
-            console.log("Session invalide -> Redirection login")
-            throw new Error("AUTH_INVALID")
-        }
+      if (sessionError || !sessionData.session) {
+        console.log("Session invalide -> Redirection login")
+        throw new Error("AUTH_INVALID")
+      }
 
-        // Si on est là, c'est que le serveur valide la connexion.
-        // On met à jour l'utilisateur dans le store pour être sûr d'être synchro
-        if (sessionData.session.user) {
-            setUser(sessionData.session.user)
-        }
-        
-        const currentUser = sessionData.session.user
+      // Mettre à jour l'utilisateur
+      if (sessionData.session.user) {
+        setUser(sessionData.session.user)
+      }
+      
+      const currentUser = sessionData.session.user
 
-        // 2. CHARGEMENT DES DONNÉES
-        const { data: memberData, error: memberError } = await supabase
-          .from('members')
-          .select('household_id, households(id, name)')
-          .eq('id', currentUser.id)
-          .single()
+      // 2. CHARGEMENT DU MEMBRE ET DU FOYER
+      const { data: memberData, error: memberError } = await supabase
+        .from('members')
+        .select('household_id, households(id, name)')
+        .eq('id', currentUser.id)
+        .single()
 
-        if (memberError || !memberData) throw new Error('MEMBER_FETCH_ERROR')
+      if (memberError || !memberData) {
+        console.error('Erreur membre:', memberError)
+        throw new Error('MEMBER_FETCH_ERROR')
+      }
 
-        const householdData = memberData.households as any
-        const hId = householdData.id
+      const householdData = memberData.households as any
+      const hId = householdData.id
 
-        setHousehold({ id: hId, name: householdData.name })
-        setHouseholdId(hId)
-        localStorage.setItem('homeflow_household_id', hId)
+      setHousehold({ id: hId, name: householdData.name })
+      setHouseholdId(hId)
+      localStorage.setItem('homeflow_household_id', hId)
 
-        const { data: membersData } = await supabase
-          .from('members')
-          .select('id, display_name')
-          .eq('household_id', memberData.household_id)
-        
-        setMembers(membersData || [])
+      // 3. CHARGEMENT DES MEMBRES DU FOYER
+      const { data: membersData } = await supabase
+        .from('members')
+        .select('id, display_name')
+        .eq('household_id', memberData.household_id)
+      
+      setMembers(membersData || [])
 
-        await loadTasksForHousehold(hId)
-        setError(null)
+      // 4. CHARGEMENT DES TÂCHES
+      await loadTasksForHousehold(hId)
 
     } catch (error: any) {
-        console.error('Erreur démarrage:', error)
-        
-        if (error.message === 'AUTH_INVALID') {
-            // Redirection douce vers le login
-            handleHardRefresh()
-        } else if (error.message === 'MEMBER_FETCH_ERROR') {
-            setError("Impossible de trouver votre profil membre.")
-        } else {
-            setError("Erreur de connexion.")
-        }
+      console.error('Erreur démarrage:', error)
+      
+      if (error.message === 'AUTH_INVALID') {
+        handleHardRefresh()
+      } else if (error.message === 'MEMBER_FETCH_ERROR') {
+        setError("Impossible de trouver votre profil membre. Essayez de vous reconnecter.")
+      } else {
+        setError("Erreur de connexion. Vérifiez votre réseau et réessayez.")
+      }
     } finally {
-        setLoading(false)
+      setLoading(false)
     }
   }
 
+  // --- CHARGEMENT DES TÂCHES ---
   const loadTasksForHousehold = async (targetHouseholdId: string) => {
     try {
       let query = supabase
@@ -231,6 +294,7 @@ export default function Tasks() {
     await handleHardRefresh()
   }
 
+  // --- CRÉATION DE TÂCHE (CORRIGÉE) ---
   const handleCreateTask = async (e: React.FormEvent) => {
     e.preventDefault()
     setFormError(null)
@@ -239,41 +303,44 @@ export default function Tasks() {
     setIsSubmitting(true)
 
     try {
-      if (!user) throw new Error('Utilisateur non connecté')
+      // ÉTAPE 1: Vérifier et rafraîchir la session AVANT tout
+      const sessionValid = await ensureValidSession()
+      
+      if (!sessionValid) {
+        throw new Error('SESSION_EXPIRED')
+      }
+
+      // Récupérer l'utilisateur actuel après le refresh
+      const { data: { user: currentUser } } = await supabase.auth.getUser()
+      
+      if (!currentUser) {
+        throw new Error('SESSION_EXPIRED')
+      }
+
       const hId = householdId || localStorage.getItem('homeflow_household_id')
       if (!hId) throw new Error('Erreur de foyer. Rafraîchissez la page.')
 
-      // PING CHECK
-      try {
-        const pingPromise = supabase.from('households').select('id').limit(1).single()
-        const pingTimeout = new Promise((_, reject) => setTimeout(() => reject(new Error('PING_TIMEOUT')), 2000))
-        await Promise.race([pingPromise, pingTimeout])
-      } catch (pingErr) {
-        throw new Error("CONNEXION_MORTE")
-      }
-
+      // ÉTAPE 2: Créer la tâche
       const assignedToValue = formData.assigned_to === "" ? null : formData.assigned_to
 
-      const insertPromise = supabase.from('tasks').insert({
+      const { error: insertError } = await supabase.from('tasks').insert({
         household_id: hId,
         title: formData.title,
         description: formData.description || null,
         category: formData.category,
         assigned_to: assignedToValue, 
-        created_by: user.id,
+        created_by: currentUser.id,
         points: formData.points,
         due_date: formData.due_date || null,
         status: 'pending',
       })
 
-      const timeoutPromise = new Promise((_, reject) => 
-        setTimeout(() => reject(new Error('TIMEOUT_WRITE')), 5000)
-      )
+      if (insertError) {
+        console.error('Erreur insert:', insertError)
+        throw insertError
+      }
 
-      // @ts-ignore
-      const { error } = await Promise.race([insertPromise, timeoutPromise])
-      if (error) throw error
-
+      // SUCCÈS: Réinitialiser le formulaire et recharger
       setFormData({
         title: '',
         description: '',
@@ -283,42 +350,86 @@ export default function Tasks() {
         points: 10,
       })
       setShowModal(false)
-      loadTasksForHousehold(hId)
+      await loadTasksForHousehold(hId)
 
     } catch (err: any) {
       console.error('Erreur création:', err)
-      if (err.message === 'CONNEXION_MORTE' || err.message === 'PING_TIMEOUT' || err.message === 'TIMEOUT_WRITE') {
-        setFormError("Votre connexion s'est endormie. Veuillez rafraîchir la page.")
+      
+      if (err.message === 'SESSION_EXPIRED') {
+        setFormError("Votre session a expiré. Cliquez sur 'Rafraîchir' pour vous reconnecter.")
+      } else if (err.code === 'PGRST301' || err.message?.includes('JWT')) {
+        setFormError("Session expirée. Veuillez rafraîchir la page.")
       } else {
-        setFormError(err.message || 'Une erreur est survenue.')
+        setFormError(err.message || 'Une erreur est survenue lors de la création.')
       }
     } finally {
       setIsSubmitting(false)
     }
   }
 
+  // --- TOGGLE COMPLETION (avec refresh de session) ---
   const handleToggleComplete = async (task: Task) => {
+    // Optimistic update
     const oldStatus = task.status
     const newStatus = task.status === 'completed' ? 'pending' : 'completed'
     setTasks(current => current.map(t => t.id === task.id ? { ...t, status: newStatus } : t))
     
-    const completedAt = newStatus === 'completed' ? new Date().toISOString() : null
-    const { error } = await supabase.from('tasks').update({ 
-        status: newStatus, completed_at: completedAt
+    try {
+      // Vérifier la session avant l'opération
+      const sessionValid = await ensureValidSession()
+      if (!sessionValid) {
+        // Revert et afficher erreur
+        setTasks(current => current.map(t => t.id === task.id ? { ...t, status: oldStatus } : t))
+        setError("Session expirée. Veuillez rafraîchir la page.")
+        return
+      }
+
+      const completedAt = newStatus === 'completed' ? new Date().toISOString() : null
+      const { error } = await supabase.from('tasks').update({ 
+        status: newStatus, 
+        completed_at: completedAt
       }).eq('id', task.id)
-      
-    if (error) setTasks(current => current.map(t => t.id === task.id ? { ...t, status: oldStatus } : t))
-    else if (filter !== 'all') reloadTasks()
+        
+      if (error) {
+        // Revert on error
+        setTasks(current => current.map(t => t.id === task.id ? { ...t, status: oldStatus } : t))
+        console.error('Erreur toggle:', error)
+      } else if (filter !== 'all') {
+        // Recharger si le filtre cache la tâche modifiée
+        reloadTasks()
+      }
+    } catch (err) {
+      // Revert on error
+      setTasks(current => current.map(t => t.id === task.id ? { ...t, status: oldStatus } : t))
+      console.error('Erreur toggle:', err)
+    }
   }
 
+  // --- SUPPRESSION (avec refresh de session) ---
   const handleDeleteTask = async (taskId: string) => {
     if (!confirm('Supprimer cette tâche ?')) return
+    
     const previousTasks = [...tasks]
     setTasks(current => current.filter(t => t.id !== taskId))
+    
     try {
+      // Vérifier la session avant l'opération
+      const sessionValid = await ensureValidSession()
+      if (!sessionValid) {
+        setTasks(previousTasks)
+        setError("Session expirée. Veuillez rafraîchir la page.")
+        return
+      }
+
       const { error } = await supabase.from('tasks').delete().eq('id', taskId)
-      if (error) throw error
-    } catch (error) { setTasks(previousTasks) }
+      if (error) {
+        setTasks(previousTasks)
+        console.error('Erreur suppression:', error)
+      }
+    } catch (error) { 
+      setTasks(previousTasks)
+      console.error('Erreur suppression:', error)
+    }
   }
 
   const getCategoryStyle = (category: string) => {
@@ -336,6 +447,7 @@ export default function Tasks() {
         <div className="text-center">
           <Loader2 className="h-12 w-12 animate-spin text-blue-600 mx-auto" />
           <p className="mt-4 text-lg font-medium text-gray-700">Chargement...</p>
+          <p className="mt-2 text-sm text-gray-500">Connexion en cours...</p>
         </div>
       </div>
     )
@@ -349,11 +461,17 @@ export default function Tasks() {
           <h2 className="text-xl font-bold text-gray-900 mb-2">Problème de connexion</h2>
           <p className="text-gray-600 mb-6">{error}</p>
           <div className="space-y-3">
-            <button onClick={handleForceReload} className="w-full py-3 bg-blue-600 text-white rounded-xl hover:bg-blue-700 transition font-medium shadow-md flex items-center justify-center gap-2">
+            <button 
+              onClick={handleForceReload} 
+              className="w-full py-3 bg-blue-600 text-white rounded-xl hover:bg-blue-700 transition font-medium shadow-md flex items-center justify-center gap-2"
+            >
               <RefreshCw className="w-5 h-5" /> Réessayer
             </button>
-            <button onClick={handleHardRefresh} className="w-full py-3 bg-white border border-red-200 text-red-600 rounded-xl hover:bg-red-50 transition font-medium flex items-center justify-center gap-2">
-              <AlertTriangle className="w-5 h-5" /> Réinitialiser
+            <button 
+              onClick={handleHardRefresh} 
+              className="w-full py-3 bg-white border border-red-200 text-red-600 rounded-xl hover:bg-red-50 transition font-medium flex items-center justify-center gap-2"
+            >
+              <AlertTriangle className="w-5 h-5" /> Se reconnecter
             </button>
           </div>
         </div>
@@ -363,6 +481,7 @@ export default function Tasks() {
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-50">
+      {/* Navigation */}
       <nav className="bg-white shadow-sm border-b">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
           <div className="flex justify-between items-center h-16">
@@ -375,72 +494,133 @@ export default function Tasks() {
                 </div>
               </button>
             </div>
-            <button onClick={handleLogout} className="flex items-center px-4 py-2 text-sm text-gray-700 hover:text-gray-900 hover:bg-gray-100 rounded-lg transition">
+            <button 
+              onClick={handleLogout} 
+              className="flex items-center px-4 py-2 text-sm text-gray-700 hover:text-gray-900 hover:bg-gray-100 rounded-lg transition"
+            >
               <LogOut className="w-4 h-4 mr-2" /> Déconnexion
             </button>
           </div>
         </div>
       </nav>
 
+      {/* Main Content */}
       <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+        {/* Header */}
         <div className="flex justify-between items-center mb-8">
           <div>
             <h2 className="text-3xl font-bold text-gray-900 mb-2">Tâches familiales</h2>
             <p className="text-gray-600">{pendingCount} en cours • {completedCount} complétées</p>
           </div>
-          <button onClick={() => { setFormError(null); setShowModal(true); }} className="flex items-center px-6 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition font-medium shadow-lg hover:shadow-xl">
+          <button 
+            onClick={() => { setFormError(null); setShowModal(true); }} 
+            className="flex items-center px-6 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition font-medium shadow-lg hover:shadow-xl"
+          >
             <Plus className="w-5 h-5 mr-2" /> Nouvelle tâche
           </button>
         </div>
 
-        {/* --- FILTRES --- */}
+        {/* Filtres */}
         <div className="bg-white rounded-xl shadow-sm p-4 mb-6 border border-gray-100">
           <div className="flex flex-wrap gap-4 items-center">
-            <div className="flex items-center gap-2"><Filter className="w-5 h-5 text-gray-500" /><span className="text-sm font-medium text-gray-700">Filtres :</span></div>
+            <div className="flex items-center gap-2">
+              <Filter className="w-5 h-5 text-gray-500" />
+              <span className="text-sm font-medium text-gray-700">Filtres :</span>
+            </div>
             <div className="flex gap-2">
-              <button onClick={() => setFilter('all')} className={`px-4 py-2 rounded-lg text-sm font-medium transition ${filter === 'all' ? 'bg-blue-600 text-white' : 'bg-gray-100 text-gray-700 hover:bg-gray-200'}`}>Toutes</button>
-              <button onClick={() => setFilter('pending')} className={`px-4 py-2 rounded-lg text-sm font-medium transition ${filter === 'pending' ? 'bg-blue-600 text-white' : 'bg-gray-100 text-gray-700 hover:bg-gray-200'}`}>En cours</button>
-              <button onClick={() => setFilter('completed')} className={`px-4 py-2 rounded-lg text-sm font-medium transition ${filter === 'completed' ? 'bg-blue-600 text-white' : 'bg-gray-100 text-gray-700 hover:bg-gray-200'}`}>Complétées</button>
+              <button 
+                onClick={() => setFilter('all')} 
+                className={`px-4 py-2 rounded-lg text-sm font-medium transition ${filter === 'all' ? 'bg-blue-600 text-white' : 'bg-gray-100 text-gray-700 hover:bg-gray-200'}`}
+              >
+                Toutes
+              </button>
+              <button 
+                onClick={() => setFilter('pending')} 
+                className={`px-4 py-2 rounded-lg text-sm font-medium transition ${filter === 'pending' ? 'bg-blue-600 text-white' : 'bg-gray-100 text-gray-700 hover:bg-gray-200'}`}
+              >
+                En cours
+              </button>
+              <button 
+                onClick={() => setFilter('completed')} 
+                className={`px-4 py-2 rounded-lg text-sm font-medium transition ${filter === 'completed' ? 'bg-blue-600 text-white' : 'bg-gray-100 text-gray-700 hover:bg-gray-200'}`}
+              >
+                Complétées
+              </button>
             </div>
             <div className="flex gap-2 items-center ml-auto">
               <User className="w-4 h-4 text-gray-500" />
-              <select value={selectedMemberFilter || ''} onChange={(e) => setSelectedMemberFilter(e.target.value || null)} className="px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:border-transparent">
+              <select 
+                value={selectedMemberFilter || ''} 
+                onChange={(e) => setSelectedMemberFilter(e.target.value || null)} 
+                className="px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+              >
                 <option value="">Tous les membres</option>
-                {members.map((member) => (<option key={member.id} value={member.id}>{member.display_name}</option>))}
+                {members.map((member) => (
+                  <option key={member.id} value={member.id}>{member.display_name}</option>
+                ))}
               </select>
             </div>
           </div>
         </div>
 
-        {/* --- LISTE --- */}
+        {/* Liste des tâches */}
         <div className="space-y-3">
           {tasks.length === 0 ? (
             <div className="bg-white rounded-xl shadow-sm p-12 text-center border border-gray-100">
               <CheckCircle2 className="w-16 h-16 text-gray-300 mx-auto mb-4" />
               <p className="text-gray-500 mb-2">Aucune tâche pour le moment</p>
-              <p className="text-sm text-gray-400">{filter === 'completed' ? 'Aucune tâche complétée' : 'Crée ta première tâche pour commencer !'}</p>
+              <p className="text-sm text-gray-400">
+                {filter === 'completed' ? 'Aucune tâche complétée' : 'Crée ta première tâche pour commencer !'}
+              </p>
             </div>
           ) : (
             tasks.map((task) => (
-              <div key={task.id} className={`bg-white rounded-xl shadow-sm p-6 border transition hover:shadow-md ${task.status === 'completed' ? 'border-green-200 bg-green-50' : 'border-gray-100'}`}>
+              <div 
+                key={task.id} 
+                className={`bg-white rounded-xl shadow-sm p-6 border transition hover:shadow-md ${
+                  task.status === 'completed' ? 'border-green-200 bg-green-50' : 'border-gray-100'
+                }`}
+              >
                 <div className="flex items-start gap-4">
                   <button onClick={() => handleToggleComplete(task)} className="mt-1 flex-shrink-0">
-                    {task.status === 'completed' ? (<CheckCircle2 className="w-6 h-6 text-green-600" />) : (<Circle className="w-6 h-6 text-gray-400 hover:text-blue-600 transition" />)}
+                    {task.status === 'completed' ? (
+                      <CheckCircle2 className="w-6 h-6 text-green-600" />
+                    ) : (
+                      <Circle className="w-6 h-6 text-gray-400 hover:text-blue-600 transition" />
+                    )}
                   </button>
                   <div className="flex-1">
                     <div className="flex items-start justify-between gap-4">
                       <div className="flex-1">
-                        <h3 className={`text-lg font-semibold mb-1 ${task.status === 'completed' ? 'text-gray-500 line-through' : 'text-gray-900'}`}>{task.title}</h3>
-                        {task.description && (<p className="text-gray-600 text-sm mb-3">{task.description}</p>)}
+                        <h3 className={`text-lg font-semibold mb-1 ${
+                          task.status === 'completed' ? 'text-gray-500 line-through' : 'text-gray-900'
+                        }`}>
+                          {task.title}
+                        </h3>
+                        {task.description && (
+                          <p className="text-gray-600 text-sm mb-3">{task.description}</p>
+                        )}
                         <div className="flex flex-wrap gap-2 items-center">
-                          <span className={`px-3 py-1 rounded-full text-xs font-medium ${getCategoryStyle(task.category)}`}>{CATEGORIES.find(c => c.value === task.category)?.label}</span>
-                          
-                          {task.due_date && (<span className="flex items-center text-xs text-gray-600"><Clock className="w-3 h-3 mr-1" />{new Date(task.due_date).toLocaleDateString('fr-FR')}</span>)}
+                          <span className={`px-3 py-1 rounded-full text-xs font-medium ${getCategoryStyle(task.category)}`}>
+                            {CATEGORIES.find(c => c.value === task.category)?.label}
+                          </span>
+                          {task.due_date && (
+                            <span className="flex items-center text-xs text-gray-600">
+                              <Clock className="w-3 h-3 mr-1" />
+                              {new Date(task.due_date).toLocaleDateString('fr-FR')}
+                            </span>
+                          )}
                           <span className="text-xs font-medium text-blue-600">{task.points} pts</span>
                         </div>
                       </div>
                       <div className="flex gap-2">
-                        <button onClick={() => handleDeleteTask(task.id)} className="p-2 text-red-600 hover:bg-red-50 rounded-lg transition" title="Supprimer"><Trash2 className="w-5 h-5" /></button>
+                        <button 
+                          onClick={() => handleDeleteTask(task.id)} 
+                          className="p-2 text-red-600 hover:bg-red-50 rounded-lg transition" 
+                          title="Supprimer"
+                        >
+                          <Trash2 className="w-5 h-5" />
+                        </button>
                       </div>
                     </div>
                   </div>
@@ -451,26 +631,35 @@ export default function Tasks() {
         </div>
       </main>
 
-      {/* --- MODAL --- */}
+      {/* Modal de création */}
       {showModal && (
         <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4 z-50">
           <div className="bg-white rounded-2xl shadow-2xl max-w-2xl w-full max-h-[90vh] overflow-y-auto">
             <div className="sticky top-0 bg-white border-b px-6 py-4 flex justify-between items-center">
               <h3 className="text-2xl font-bold text-gray-900">Créer une tâche</h3>
-              <button onClick={() => setShowModal(false)} className="p-2 hover:bg-gray-100 rounded-lg transition" disabled={isSubmitting}><X className="w-5 h-5" /></button>
+              <button 
+                onClick={() => setShowModal(false)} 
+                className="p-2 hover:bg-gray-100 rounded-lg transition" 
+                disabled={isSubmitting}
+              >
+                <X className="w-5 h-5" />
+              </button>
             </div>
 
             {formError && (
               <div className="mx-6 mt-4 p-4 bg-red-50 border border-red-200 rounded-lg flex flex-col gap-2">
                 <div className="flex items-start gap-3">
                   <AlertCircle className="w-5 h-5 text-red-600 flex-shrink-0 mt-0.5" />
-                  <div><h4 className="text-sm font-medium text-red-800">Erreur</h4><p className="text-sm text-red-600 mt-1">{formError}</p></div>
+                  <div>
+                    <h4 className="text-sm font-medium text-red-800">Erreur</h4>
+                    <p className="text-sm text-red-600 mt-1">{formError}</p>
+                  </div>
                 </div>
                 <button 
                   onClick={handleForceReload} 
                   className="mt-2 text-sm text-blue-600 font-medium hover:underline flex items-center gap-1 self-end"
                 >
-                  <RefreshCw className="w-4 h-4" /> Rafraîchir la page pour reconnecter
+                  <RefreshCw className="w-4 h-4" /> Rafraîchir la page
                 </button>
               </div>
             )}
@@ -478,41 +667,106 @@ export default function Tasks() {
             <form onSubmit={handleCreateTask} className="p-6 space-y-6">
               <div>
                 <label className="block text-sm font-medium text-gray-700 mb-2">Titre de la tâche *</label>
-                <input type="text" value={formData.title} onChange={(e) => setFormData({ ...formData, title: e.target.value })} placeholder="Ex: Faire les courses" className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent" required disabled={isSubmitting} />
+                <input 
+                  type="text" 
+                  value={formData.title} 
+                  onChange={(e) => setFormData({ ...formData, title: e.target.value })} 
+                  placeholder="Ex: Faire les courses" 
+                  className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent" 
+                  required 
+                  disabled={isSubmitting} 
+                />
               </div>
+              
               <div>
                 <label className="block text-sm font-medium text-gray-700 mb-2">Description</label>
-                <textarea value={formData.description} onChange={(e) => setFormData({ ...formData, description: e.target.value })} placeholder="Détails de la tâche..." rows={3} className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent" disabled={isSubmitting} />
+                <textarea 
+                  value={formData.description} 
+                  onChange={(e) => setFormData({ ...formData, description: e.target.value })} 
+                  placeholder="Détails de la tâche..." 
+                  rows={3} 
+                  className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent" 
+                  disabled={isSubmitting} 
+                />
               </div>
+              
               <div className="grid grid-cols-2 gap-4">
                 <div>
                   <label className="block text-sm font-medium text-gray-700 mb-2">Catégorie</label>
-                  <select value={formData.category} onChange={(e) => setFormData({ ...formData, category: e.target.value })} className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent" disabled={isSubmitting}>
-                    {CATEGORIES.map((cat) => (<option key={cat.value} value={cat.value}>{cat.label}</option>))}
+                  <select 
+                    value={formData.category} 
+                    onChange={(e) => setFormData({ ...formData, category: e.target.value })} 
+                    className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent" 
+                    disabled={isSubmitting}
+                  >
+                    {CATEGORIES.map((cat) => (
+                      <option key={cat.value} value={cat.value}>{cat.label}</option>
+                    ))}
                   </select>
                 </div>
                 <div>
                   <label className="block text-sm font-medium text-gray-700 mb-2">Assigner à</label>
-                  <select value={formData.assigned_to} onChange={(e) => setFormData({ ...formData, assigned_to: e.target.value })} className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent" disabled={isSubmitting}>
+                  <select 
+                    value={formData.assigned_to} 
+                    onChange={(e) => setFormData({ ...formData, assigned_to: e.target.value })} 
+                    className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent" 
+                    disabled={isSubmitting}
+                  >
                     <option value="">Non assigné</option>
-                    {members.map((member) => (<option key={member.id} value={member.id}>{member.display_name}</option>))}
+                    {members.map((member) => (
+                      <option key={member.id} value={member.id}>{member.display_name}</option>
+                    ))}
                   </select>
                 </div>
               </div>
+              
               <div className="grid grid-cols-2 gap-4">
                 <div>
                   <label className="block text-sm font-medium text-gray-700 mb-2">Date d'échéance</label>
-                  <input type="date" value={formData.due_date} onChange={(e) => setFormData({ ...formData, due_date: e.target.value })} className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent" disabled={isSubmitting} />
+                  <input 
+                    type="date" 
+                    value={formData.due_date} 
+                    onChange={(e) => setFormData({ ...formData, due_date: e.target.value })} 
+                    className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent" 
+                    disabled={isSubmitting} 
+                  />
                 </div>
                 <div>
                   <label className="block text-sm font-medium text-gray-700 mb-2">Points</label>
-                  <input type="number" value={formData.points} onChange={(e) => setFormData({ ...formData, points: parseInt(e.target.value) })} min="1" max="100" className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent" disabled={isSubmitting} />
+                  <input 
+                    type="number" 
+                    value={formData.points} 
+                    onChange={(e) => setFormData({ ...formData, points: parseInt(e.target.value) })} 
+                    min="1" 
+                    max="100" 
+                    className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent" 
+                    disabled={isSubmitting} 
+                  />
                 </div>
               </div>
+              
               <div className="flex gap-3 pt-4">
-                <button type="button" onClick={() => setShowModal(false)} className="flex-1 px-6 py-3 border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50 transition font-medium" disabled={isSubmitting}>Annuler</button>
-                <button type="submit" disabled={isSubmitting} className="flex-1 px-6 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition font-medium disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center">
-                  {isSubmitting ? (<><Loader2 className="w-5 h-5 mr-2 animate-spin" />Création...</>) : ('Créer la tâche')}
+                <button 
+                  type="button" 
+                  onClick={() => setShowModal(false)} 
+                  className="flex-1 px-6 py-3 border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50 transition font-medium" 
+                  disabled={isSubmitting}
+                >
+                  Annuler
+                </button>
+                <button 
+                  type="submit" 
+                  disabled={isSubmitting} 
+                  className="flex-1 px-6 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition font-medium disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center"
+                >
+                  {isSubmitting ? (
+                    <>
+                      <Loader2 className="w-5 h-5 mr-2 animate-spin" />
+                      Création...
+                    </>
+                  ) : (
+                    'Créer la tâche'
+                  )}
                 </button>
               </div>
             </form>
