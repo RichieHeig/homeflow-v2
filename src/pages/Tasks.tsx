@@ -61,7 +61,7 @@ const CATEGORIES = [
 
 export default function Tasks() {
   const navigate = useNavigate()
-  const { user, setUser } = useAuthStore()
+  const { setUser } = useAuthStore()
   
   // Data States
   const [tasks, setTasks] = useState<Task[]>([])
