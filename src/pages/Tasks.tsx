@@ -59,6 +59,23 @@ const CATEGORIES = [
   { value: 'autre', label: 'Autre', color: 'bg-pink-100 text-pink-700' },
 ]
 
+// Clé de stockage Supabase (adapter si différent)
+const SUPABASE_STORAGE_KEY = 'sb-phojtiaesozznmlaxrl-auth-token'
+
+// Fonction utilitaire pour récupérer l'utilisateur sans bloquer
+const getUserFromStorage = (): any => {
+  try {
+    const storedData = localStorage.getItem(SUPABASE_STORAGE_KEY)
+    if (storedData) {
+      const parsed = JSON.parse(storedData)
+      return parsed?.user || null
+    }
+  } catch (e) {
+    console.error('Erreur lecture localStorage:', e)
+  }
+  return null
+}
+
 export default function Tasks() {
   const navigate = useNavigate()
   const { setUser } = useAuthStore()
@@ -79,7 +96,6 @@ export default function Tasks() {
   const [selectedMemberFilter, setSelectedMemberFilter] = useState<string | null>(null)
   
   const hasLoadedData = useRef(false)
-  const sessionCheckInterval = useRef<NodeJS.Timeout | null>(null)
 
   const [formData, setFormData] = useState({
     title: '',
@@ -92,9 +108,6 @@ export default function Tasks() {
 
   // --- HARD REFRESH (déconnexion complète) ---
   const handleHardRefresh = useCallback(async () => {
-    if (sessionCheckInterval.current) {
-      clearInterval(sessionCheckInterval.current)
-    }
     try { await supabase.auth.signOut() } catch (e) { /* ignore */ }
     localStorage.clear()
     sessionStorage.clear()
@@ -134,7 +147,7 @@ export default function Tasks() {
           setLoading(false)
           setError("Le chargement a pris trop de temps. Vérifiez votre connexion.")
         }
-      }, 8000)
+      }, 10000)
     }
     return () => clearTimeout(safetyTimer)
   }, [loading])
@@ -161,18 +174,29 @@ export default function Tasks() {
       setLoading(true)
       setError(null)
 
-      const { data: sessionData, error: sessionError } = await supabase.auth.getSession()
+      // Essayer d'abord localStorage (instantané)
+      let currentUser = getUserFromStorage()
+      
+      // Si pas dans localStorage, essayer getSession avec timeout
+      if (!currentUser) {
+        try {
+          const sessionPromise = supabase.auth.getSession()
+          const timeoutPromise = new Promise((_, reject) => 
+            setTimeout(() => reject(new Error('TIMEOUT')), 3000)
+          )
+          const { data: sessionData } = await Promise.race([sessionPromise, timeoutPromise]) as any
+          currentUser = sessionData?.session?.user
+        } catch (e) {
+          console.log('⚠️ getSession timeout au chargement')
+        }
+      }
 
-      if (sessionError || !sessionData.session) {
-        console.log("Session invalide -> Redirection login")
+      if (!currentUser) {
+        console.log("Pas d'utilisateur -> Redirection login")
         throw new Error("AUTH_INVALID")
       }
 
-      if (sessionData.session.user) {
-        setUser(sessionData.session.user)
-      }
-      
-      const currentUser = sessionData.session.user
+      setUser(currentUser)
 
       const { data: memberData, error: memberError } = await supabase
         .from('members')
@@ -246,7 +270,7 @@ export default function Tasks() {
     await handleHardRefresh()
   }
 
-  // --- CRÉATION DE TÂCHE (SIMPLIFIÉE - SANS REFRESH BLOQUANT) ---
+  // --- CRÉATION DE TÂCHE (AVEC LOCALSTORAGE EN PRIORITÉ) ---
   const handleCreateTask = async (e: React.FormEvent) => {
     e.preventDefault()
     setFormError(null)
@@ -257,24 +281,30 @@ export default function Tasks() {
     console.log('📝 Début création tâche...')
 
     try {
-  // ÉTAPE 1: Récupérer la session avec TIMEOUT
-  const sessionPromise = supabase.auth.getSession()
-  const timeoutPromise = new Promise((_, reject) => 
-    setTimeout(() => reject(new Error('SESSION_TIMEOUT')), 3000)
-  )
-  
-  const { data: { session }, error: sessionError } = await Promise.race([
-    sessionPromise, 
-    timeoutPromise
-  ]) as any
-  
-  console.log('🔑 Session récupérée:', session ? 'OK' : 'NULL', sessionError?.message || '')
+      // ÉTAPE 1: Récupérer l'utilisateur depuis localStorage (instantané, ne bloque pas)
+      let currentUser = getUserFromStorage()
+      console.log('🔑 User from localStorage:', currentUser?.id ? 'OK' : 'NULL')
+      
+      // Si pas trouvé dans localStorage, essayer getSession avec timeout court
+      if (!currentUser) {
+        console.log('⏳ Fallback to getSession...')
+        try {
+          const sessionPromise = supabase.auth.getSession()
+          const timeoutPromise = new Promise((_, reject) => 
+            setTimeout(() => reject(new Error('TIMEOUT')), 2000)
+          )
+          const { data: { session } } = await Promise.race([sessionPromise, timeoutPromise]) as any
+          currentUser = session?.user
+          console.log('🔑 User from getSession:', currentUser?.id ? 'OK' : 'NULL')
+        } catch (e) {
+          console.log('⚠️ getSession timeout')
+        }
+      }
 
-  if (!session || sessionError) {
-    throw new Error('SESSION_EXPIRED')
-  }
+      if (!currentUser) {
+        throw new Error('SESSION_EXPIRED')
+      }
 
-      const currentUser = session.user
       console.log('👤 Utilisateur:', currentUser.id)
 
       const hId = householdId || localStorage.getItem('homeflow_household_id')
@@ -297,7 +327,7 @@ export default function Tasks() {
         status: 'pending' as const,
       }
 
-      console.log('📤 Envoi tâche:', JSON.stringify(taskData))
+      console.log('📤 Envoi tâche:', taskData)
 
       const { data: insertData, error: insertError } = await supabase
         .from('tasks')
@@ -329,7 +359,7 @@ export default function Tasks() {
       console.error('❌ Erreur création:', err)
       
       if (err.message === 'SESSION_EXPIRED') {
-        setFormError("Votre session a expiré. Cliquez sur 'Rafraîchir' pour vous reconnecter.")
+        setFormError("Votre session a expiré. Rafraîchissez la page pour vous reconnecter.")
       } else if (err.code === '42501' || err.message?.includes('policy')) {
         setFormError("Erreur de permission. Vérifiez que vous êtes bien connecté.")
       } else if (err.code === 'PGRST301' || err.message?.includes('JWT')) {
