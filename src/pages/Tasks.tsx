@@ -60,7 +60,7 @@ const CATEGORIES = [
 ]
 
 // Clé de stockage Supabase (adapter si différent)
-const SUPABASE_STORAGE_KEY = 'sb-phojtiaesozznmlaxrl-auth-token'
+const SUPABASE_STORAGE_KEY = 'sb-phojtiaeesozznnlaxrl-auth-token'
 
 // Fonction utilitaire pour récupérer l'utilisateur sans bloquer
 const getUserFromStorage = (): any => {
