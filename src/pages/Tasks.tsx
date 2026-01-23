@@ -92,7 +92,6 @@ export default function Tasks() {
 
   // --- HARD REFRESH (déconnexion complète) ---
   const handleHardRefresh = useCallback(async () => {
-    // Nettoyer l'interval si actif
     if (sessionCheckInterval.current) {
       clearInterval(sessionCheckInterval.current)
     }
@@ -106,29 +105,6 @@ export default function Tasks() {
   const handleForceReload = () => {
     window.location.reload()
   }
-
-  // --- FONCTION UTILITAIRE : Vérifier et rafraîchir la session ---
-  const ensureValidSession = useCallback(async (): Promise<boolean> => {
-    try {
-      // Tenter de rafraîchir la session
-      const { data: { session }, error } = await supabase.auth.refreshSession()
-      
-      if (error || !session) {
-        console.warn('Session invalide ou expirée')
-        return false
-      }
-      
-      // Mettre à jour l'utilisateur dans le store
-      if (session.user) {
-        setUser(session.user)
-      }
-      
-      return true
-    } catch (err) {
-      console.error('Erreur refresh session:', err)
-      return false
-    }
-  }, [setUser])
 
   // --- LISTENER POUR LES CHANGEMENTS D'AUTH ---
   useEffect(() => {
@@ -148,25 +124,6 @@ export default function Tasks() {
     return () => subscription.unsubscribe()
   }, [handleHardRefresh, setUser])
 
-  // --- VÉRIFICATION PÉRIODIQUE DE LA SESSION (toutes les 2 minutes) ---
-  useEffect(() => {
-    // Vérifier la session toutes les 2 minutes pour éviter les déconnexions surprises
-    sessionCheckInterval.current = setInterval(async () => {
-      const isValid = await ensureValidSession()
-      if (!isValid) {
-        console.warn('🚨 Session expirée détectée lors du check périodique')
-        // On ne déconnecte pas automatiquement, mais on prépare le terrain
-        // La prochaine action de l'utilisateur déclenchera la reconnexion
-      }
-    }, 2 * 60 * 1000) // 2 minutes
-    
-    return () => {
-      if (sessionCheckInterval.current) {
-        clearInterval(sessionCheckInterval.current)
-      }
-    }
-  }, [ensureValidSession])
-
   // --- SAFETY VALVE (timeout de chargement) ---
   useEffect(() => {
     let safetyTimer: NodeJS.Timeout
@@ -177,7 +134,7 @@ export default function Tasks() {
           setLoading(false)
           setError("Le chargement a pris trop de temps. Vérifiez votre connexion.")
         }
-      }, 8000) // 8 secondes max
+      }, 8000)
     }
     return () => clearTimeout(safetyTimer)
   }, [loading])
@@ -204,7 +161,6 @@ export default function Tasks() {
       setLoading(true)
       setError(null)
 
-      // 1. VÉRIFICATION DE LA SESSION
       const { data: sessionData, error: sessionError } = await supabase.auth.getSession()
 
       if (sessionError || !sessionData.session) {
@@ -212,14 +168,12 @@ export default function Tasks() {
         throw new Error("AUTH_INVALID")
       }
 
-      // Mettre à jour l'utilisateur
       if (sessionData.session.user) {
         setUser(sessionData.session.user)
       }
       
       const currentUser = sessionData.session.user
 
-      // 2. CHARGEMENT DU MEMBRE ET DU FOYER
       const { data: memberData, error: memberError } = await supabase
         .from('members')
         .select('household_id, households(id, name)')
@@ -238,7 +192,6 @@ export default function Tasks() {
       setHouseholdId(hId)
       localStorage.setItem('homeflow_household_id', hId)
 
-      // 3. CHARGEMENT DES MEMBRES DU FOYER
       const { data: membersData } = await supabase
         .from('members')
         .select('id, display_name')
@@ -246,7 +199,6 @@ export default function Tasks() {
       
       setMembers(membersData || [])
 
-      // 4. CHARGEMENT DES TÂCHES
       await loadTasksForHousehold(hId)
 
     } catch (error: any) {
@@ -294,7 +246,7 @@ export default function Tasks() {
     await handleHardRefresh()
   }
 
-  // --- CRÉATION DE TÂCHE (CORRIGÉE) ---
+  // --- CRÉATION DE TÂCHE (SIMPLIFIÉE - SANS REFRESH BLOQUANT) ---
   const handleCreateTask = async (e: React.FormEvent) => {
     e.preventDefault()
     setFormError(null)
@@ -302,28 +254,30 @@ export default function Tasks() {
     if (isSubmitting) return
     setIsSubmitting(true)
 
+    console.log('📝 Début création tâche...')
+
     try {
-      // ÉTAPE 1: Vérifier et rafraîchir la session AVANT tout
-      const sessionValid = await ensureValidSession()
+      // ÉTAPE 1: Récupérer directement la session existante (sans refresh bloquant)
+      const { data: { session }, error: sessionError } = await supabase.auth.getSession()
       
-      if (!sessionValid) {
+      console.log('🔑 Session récupérée:', session ? 'OK' : 'NULL', sessionError?.message || '')
+
+      if (!session || sessionError) {
         throw new Error('SESSION_EXPIRED')
       }
 
-      // Récupérer l'utilisateur actuel après le refresh
-      const { data: { user: currentUser } } = await supabase.auth.getUser()
-      
-      if (!currentUser) {
-        throw new Error('SESSION_EXPIRED')
-      }
+      const currentUser = session.user
+      console.log('👤 Utilisateur:', currentUser.id)
 
       const hId = householdId || localStorage.getItem('homeflow_household_id')
       if (!hId) throw new Error('Erreur de foyer. Rafraîchissez la page.')
 
+      console.log('🏠 Household ID:', hId)
+
       // ÉTAPE 2: Créer la tâche
       const assignedToValue = formData.assigned_to === "" ? null : formData.assigned_to
 
-      const { error: insertError } = await supabase.from('tasks').insert({
+      const taskData = {
         household_id: hId,
         title: formData.title,
         description: formData.description || null,
@@ -332,15 +286,26 @@ export default function Tasks() {
         created_by: currentUser.id,
         points: formData.points,
         due_date: formData.due_date || null,
-        status: 'pending',
-      })
+        status: 'pending' as const,
+      }
+
+      console.log('📤 Envoi tâche:', JSON.stringify(taskData))
+
+      const { data: insertData, error: insertError } = await supabase
+        .from('tasks')
+        .insert(taskData)
+        .select()
+
+      console.log('📥 Réponse insert:', insertData, insertError)
 
       if (insertError) {
-        console.error('Erreur insert:', insertError)
+        console.error('❌ Erreur insert:', insertError)
         throw insertError
       }
 
-      // SUCCÈS: Réinitialiser le formulaire et recharger
+      console.log('✅ Tâche créée avec succès!')
+
+      // SUCCÈS
       setFormData({
         title: '',
         description: '',
@@ -353,10 +318,12 @@ export default function Tasks() {
       await loadTasksForHousehold(hId)
 
     } catch (err: any) {
-      console.error('Erreur création:', err)
+      console.error('❌ Erreur création:', err)
       
       if (err.message === 'SESSION_EXPIRED') {
         setFormError("Votre session a expiré. Cliquez sur 'Rafraîchir' pour vous reconnecter.")
+      } else if (err.code === '42501' || err.message?.includes('policy')) {
+        setFormError("Erreur de permission. Vérifiez que vous êtes bien connecté.")
       } else if (err.code === 'PGRST301' || err.message?.includes('JWT')) {
         setFormError("Session expirée. Veuillez rafraîchir la page.")
       } else {
@@ -367,23 +334,13 @@ export default function Tasks() {
     }
   }
 
-  // --- TOGGLE COMPLETION (avec refresh de session) ---
+  // --- TOGGLE COMPLETION ---
   const handleToggleComplete = async (task: Task) => {
-    // Optimistic update
     const oldStatus = task.status
     const newStatus = task.status === 'completed' ? 'pending' : 'completed'
     setTasks(current => current.map(t => t.id === task.id ? { ...t, status: newStatus } : t))
     
     try {
-      // Vérifier la session avant l'opération
-      const sessionValid = await ensureValidSession()
-      if (!sessionValid) {
-        // Revert et afficher erreur
-        setTasks(current => current.map(t => t.id === task.id ? { ...t, status: oldStatus } : t))
-        setError("Session expirée. Veuillez rafraîchir la page.")
-        return
-      }
-
       const completedAt = newStatus === 'completed' ? new Date().toISOString() : null
       const { error } = await supabase.from('tasks').update({ 
         status: newStatus, 
@@ -391,21 +348,18 @@ export default function Tasks() {
       }).eq('id', task.id)
         
       if (error) {
-        // Revert on error
         setTasks(current => current.map(t => t.id === task.id ? { ...t, status: oldStatus } : t))
         console.error('Erreur toggle:', error)
       } else if (filter !== 'all') {
-        // Recharger si le filtre cache la tâche modifiée
         reloadTasks()
       }
     } catch (err) {
-      // Revert on error
       setTasks(current => current.map(t => t.id === task.id ? { ...t, status: oldStatus } : t))
       console.error('Erreur toggle:', err)
     }
   }
 
-  // --- SUPPRESSION (avec refresh de session) ---
+  // --- SUPPRESSION ---
   const handleDeleteTask = async (taskId: string) => {
     if (!confirm('Supprimer cette tâche ?')) return
     
@@ -413,14 +367,6 @@ export default function Tasks() {
     setTasks(current => current.filter(t => t.id !== taskId))
     
     try {
-      // Vérifier la session avant l'opération
-      const sessionValid = await ensureValidSession()
-      if (!sessionValid) {
-        setTasks(previousTasks)
-        setError("Session expirée. Veuillez rafraîchir la page.")
-        return
-      }
-
       const { error } = await supabase.from('tasks').delete().eq('id', taskId)
       if (error) {
         setTasks(previousTasks)
