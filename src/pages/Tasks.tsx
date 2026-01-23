@@ -59,17 +59,39 @@ const CATEGORIES = [
   { value: 'autre', label: 'Autre', color: 'bg-pink-100 text-pink-700' },
 ]
 
-// Clé de stockage Supabase (adapter si différent)
-const SUPABASE_STORAGE_KEY = 'sb-phojtiaeesozznnlaxrl-auth-token'
-
 // Fonction utilitaire pour récupérer l'utilisateur sans bloquer
+// Cherche automatiquement la bonne clé Supabase dans localStorage
 const getUserFromStorage = (): any => {
   try {
-    const storedData = localStorage.getItem(SUPABASE_STORAGE_KEY)
-    if (storedData) {
-      const parsed = JSON.parse(storedData)
-      return parsed?.user || null
+    // Chercher toutes les clés Supabase possibles
+    const keys = Object.keys(localStorage).filter(k => 
+      k.startsWith('sb-') && k.endsWith('-auth-token')
+    )
+    
+    console.log('🔍 Clés Supabase trouvées:', keys)
+    
+    for (const key of keys) {
+      const storedData = localStorage.getItem(key)
+      if (storedData) {
+        const parsed = JSON.parse(storedData)
+        if (parsed?.user) {
+          console.log('🔑 Session trouvée dans:', key)
+          return parsed.user
+        }
+      }
     }
+    
+    // Fallback: chercher aussi avec le pattern "supabase.auth.token"
+    const legacyKey = 'supabase.auth.token'
+    const legacyData = localStorage.getItem(legacyKey)
+    if (legacyData) {
+      const parsed = JSON.parse(legacyData)
+      if (parsed?.currentSession?.user) {
+        console.log('🔑 Session trouvée dans clé legacy')
+        return parsed.currentSession.user
+      }
+    }
+    
   } catch (e) {
     console.error('Erreur lecture localStorage:', e)
   }
@@ -176,9 +198,11 @@ export default function Tasks() {
 
       // Essayer d'abord localStorage (instantané)
       let currentUser = getUserFromStorage()
+      console.log('👤 User from storage:', currentUser?.id ? 'OK' : 'NULL')
       
       // Si pas dans localStorage, essayer getSession avec timeout
       if (!currentUser) {
+        console.log('⏳ Fallback to getSession...')
         try {
           const sessionPromise = supabase.auth.getSession()
           const timeoutPromise = new Promise((_, reject) => 
@@ -186,6 +210,7 @@ export default function Tasks() {
           )
           const { data: sessionData } = await Promise.race([sessionPromise, timeoutPromise]) as any
           currentUser = sessionData?.session?.user
+          console.log('👤 User from getSession:', currentUser?.id ? 'OK' : 'NULL')
         } catch (e) {
           console.log('⚠️ getSession timeout au chargement')
         }
