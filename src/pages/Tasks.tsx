@@ -65,10 +65,20 @@ const SUPABASE_STORAGE_KEY = 'sb-phojtiaeesozznnlaxrl-auth-token'
 // Fonction utilitaire pour récupérer l'utilisateur sans bloquer
 const getUserFromStorage = (): any => {
   try {
-    const storedData = localStorage.getItem(SUPABASE_STORAGE_KEY)
-    if (storedData) {
-      const parsed = JSON.parse(storedData)
-      return parsed?.user || null
+    // Chercher toutes les clés Supabase possibles
+    const keys = Object.keys(localStorage).filter(k => 
+      k.startsWith('sb-') && k.endsWith('-auth-token')
+    )
+    
+    for (const key of keys) {
+      const storedData = localStorage.getItem(key)
+      if (storedData) {
+        const parsed = JSON.parse(storedData)
+        if (parsed?.user) {
+          console.log('🔑 Found session in key:', key)
+          return parsed.user
+        }
+      }
     }
   } catch (e) {
     console.error('Erreur lecture localStorage:', e)
