@@ -257,14 +257,22 @@ export default function Tasks() {
     console.log('📝 Début création tâche...')
 
     try {
-      // ÉTAPE 1: Récupérer directement la session existante (sans refresh bloquant)
-      const { data: { session }, error: sessionError } = await supabase.auth.getSession()
-      
-      console.log('🔑 Session récupérée:', session ? 'OK' : 'NULL', sessionError?.message || '')
+  // ÉTAPE 1: Récupérer la session avec TIMEOUT
+  const sessionPromise = supabase.auth.getSession()
+  const timeoutPromise = new Promise((_, reject) => 
+    setTimeout(() => reject(new Error('SESSION_TIMEOUT')), 3000)
+  )
+  
+  const { data: { session }, error: sessionError } = await Promise.race([
+    sessionPromise, 
+    timeoutPromise
+  ]) as any
+  
+  console.log('🔑 Session récupérée:', session ? 'OK' : 'NULL', sessionError?.message || '')
 
-      if (!session || sessionError) {
-        throw new Error('SESSION_EXPIRED')
-      }
+  if (!session || sessionError) {
+    throw new Error('SESSION_EXPIRED')
+  }
 
       const currentUser = session.user
       console.log('👤 Utilisateur:', currentUser.id)
