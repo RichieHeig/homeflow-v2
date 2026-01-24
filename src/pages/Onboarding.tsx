@@ -1,264 +1,67 @@
-import { useState } from 'react'
+import React, { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { supabase } from '@/lib/supabase'
-import { useAuthStore } from '@/store/authStore'
-import { Home, Users, Plus } from 'lucide-react'
 
 export default function Onboarding() {
   const navigate = useNavigate()
-  const { user } = useAuthStore()
-  const [step, setStep] = useState<'choice' | 'create' | 'join'>('choice')
-  const [loading, setLoading] = useState(false)
-  const [error, setError] = useState('')
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
 
-  // État pour créer un foyer
-  const [householdName, setHouseholdName] = useState('')
-  const [displayName, setDisplayName] = useState('')
+  useEffect(() => {
+    const run = async () => {
+      setLoading(true)
+      setError(null)
 
-  // État pour rejoindre un foyer
-  const [joinCode, setJoinCode] = useState('')
-  const [joinDisplayName, setJoinDisplayName] = useState('')
+      try {
+        const { data } = await supabase.auth.getUser()
+        const user = data.user
+        if (!user) {
+          navigate('/login', { replace: true })
+          return
+        }
 
-  const handleCreateHousehold = async (e: React.FormEvent) => {
-    e.preventDefault()
-    setLoading(true)
-    setError('')
+        // Si l'utilisateur est déjà membre → go tasks
+        const { data: member } = await supabase
+          .from('members')
+          .select('id')
+          .eq('id', user.id)
+          .single()
 
-    try {
-      if (!user) throw new Error('Non authentifié')
+        if (member?.id) {
+          navigate('/tasks', { replace: true })
+          return
+        }
 
-      // Appeler la fonction RPC create_household
-      const { data, error } = await supabase.rpc('create_household', {
-        _household_name: householdName,
-        _display_name: displayName,
-      })
-
-      if (error) throw error
-      
-      if (data?.error) {
-        throw new Error(data.error)
+        // Sinon, fallback minimal : on redirige vers login
+        // (car créer un foyer + member dépend de tes policies RLS)
+        setError("Profil membre introuvable. Veuillez vous reconnecter.")
+      } catch (e: any) {
+        setError(e?.message || "Erreur onboarding")
+      } finally {
+        setLoading(false)
       }
-
-      if (data?.success) {
-        // Rediriger vers le dashboard
-        navigate('/dashboard')
-      } else {
-        throw new Error('Erreur lors de la création du foyer')
-      }
-    } catch (err: any) {
-      console.error('Erreur:', err)
-      setError(err.message || 'Une erreur est survenue')
-    } finally {
-      setLoading(false)
     }
-  }
 
-  const handleJoinHousehold = async (e: React.FormEvent) => {
-    e.preventDefault()
-    setLoading(true)
-    setError('')
+    run()
+  }, [navigate])
 
-    try {
-      if (!user) throw new Error('Non authentifié')
-
-      // Appeler la fonction RPC join_household
-      const { data, error } = await supabase.rpc('join_household', {
-        _join_code: joinCode.toUpperCase(),
-        _display_name: joinDisplayName,
-      })
-
-      if (error) throw error
-      
-      if (data?.error) {
-        throw new Error(data.error)
-      }
-
-      if (data?.success) {
-        // Rediriger vers le dashboard
-        navigate('/dashboard')
-      } else {
-        throw new Error('Erreur lors de la connexion au foyer')
-      }
-    } catch (err: any) {
-      console.error('Erreur:', err)
-      setError(err.message || 'Une erreur est survenue')
-    } finally {
-      setLoading(false)
-    }
+  if (loading) {
+    return <div className="min-h-screen flex items-center justify-center">Chargement...</div>
   }
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100 flex items-center justify-center p-4">
-      <div className="w-full max-w-md">
-        <div className="text-center mb-8">
-          <div className="inline-flex items-center justify-center w-16 h-16 bg-blue-600 rounded-2xl mb-4">
-            <Home className="w-8 h-8 text-white" />
-          </div>
-          <h1 className="text-3xl font-bold text-gray-900 mb-2">Bienvenue sur HomeFlow!</h1>
-          <p className="text-gray-600">Configurons ton espace familial</p>
-        </div>
-
-        <div className="bg-white rounded-2xl shadow-xl p-8">
-          {step === 'choice' && (
-            <div className="space-y-4">
-              <h2 className="text-xl font-semibold text-gray-900 mb-6">
-                Comment veux-tu commencer ?
-              </h2>
-
-              <button
-                onClick={() => setStep('create')}
-                className="w-full flex items-center justify-between p-6 border-2 border-gray-200 rounded-xl hover:border-blue-500 hover:bg-blue-50 transition group"
-              >
-                <div className="flex items-center">
-                  <div className="w-12 h-12 bg-blue-100 rounded-lg flex items-center justify-center mr-4 group-hover:bg-blue-200">
-                    <Plus className="w-6 h-6 text-blue-600" />
-                  </div>
-                  <div className="text-left">
-                    <div className="font-semibold text-gray-900">Créer un nouveau foyer</div>
-                    <div className="text-sm text-gray-600">Commence un nouveau groupe familial</div>
-                  </div>
-                </div>
-              </button>
-
-              <button
-                onClick={() => setStep('join')}
-                className="w-full flex items-center justify-between p-6 border-2 border-gray-200 rounded-xl hover:border-blue-500 hover:bg-blue-50 transition group"
-              >
-                <div className="flex items-center">
-                  <div className="w-12 h-12 bg-green-100 rounded-lg flex items-center justify-center mr-4 group-hover:bg-green-200">
-                    <Users className="w-6 h-6 text-green-600" />
-                  </div>
-                  <div className="text-left">
-                    <div className="font-semibold text-gray-900">Rejoindre un foyer</div>
-                    <div className="text-sm text-gray-600">Entre un code d'invitation</div>
-                  </div>
-                </div>
-              </button>
-            </div>
-          )}
-
-          {step === 'create' && (
-            <form onSubmit={handleCreateHousehold} className="space-y-6">
-              <div>
-                <button
-                  type="button"
-                  onClick={() => setStep('choice')}
-                  className="text-sm text-gray-600 hover:text-gray-900 mb-6"
-                >
-                  ← Retour
-                </button>
-                <h2 className="text-xl font-semibold text-gray-900 mb-6">
-                  Créer ton foyer
-                </h2>
-              </div>
-
-              {error && (
-                <div className="bg-red-50 border border-red-200 text-red-800 px-4 py-3 rounded-lg">
-                  {error}
-                </div>
-              )}
-
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-2">
-                  Nom du foyer
-                </label>
-                <input
-                  type="text"
-                  value={householdName}
-                  onChange={(e) => setHouseholdName(e.target.value)}
-                  placeholder="Ex: Famille Richard"
-                  className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-                  required
-                />
-              </div>
-
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-2">
-                  Ton nom d'affichage
-                </label>
-                <input
-                  type="text"
-                  value={displayName}
-                  onChange={(e) => setDisplayName(e.target.value)}
-                  placeholder="Ex: Richard"
-                  className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-                  required
-                />
-              </div>
-
-              <button
-                type="submit"
-                disabled={loading}
-                className="w-full bg-blue-600 text-white py-3 px-4 rounded-lg hover:bg-blue-700 transition disabled:opacity-50 disabled:cursor-not-allowed font-medium"
-              >
-                {loading ? 'Création...' : 'Créer le foyer'}
-              </button>
-            </form>
-          )}
-
-          {step === 'join' && (
-            <form onSubmit={handleJoinHousehold} className="space-y-6">
-              <div>
-                <button
-                  type="button"
-                  onClick={() => setStep('choice')}
-                  className="text-sm text-gray-600 hover:text-gray-900 mb-6"
-                >
-                  ← Retour
-                </button>
-                <h2 className="text-xl font-semibold text-gray-900 mb-6">
-                  Rejoindre un foyer
-                </h2>
-              </div>
-
-              {error && (
-                <div className="bg-red-50 border border-red-200 text-red-800 px-4 py-3 rounded-lg">
-                  {error}
-                </div>
-              )}
-
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-2">
-                  Code d'invitation
-                </label>
-                <input
-                  type="text"
-                  value={joinCode}
-                  onChange={(e) => setJoinCode(e.target.value.toUpperCase())}
-                  placeholder="Ex: ABC123"
-                  className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent uppercase"
-                  maxLength={6}
-                  required
-                />
-                <p className="mt-2 text-sm text-gray-500">
-                  Demande le code à un membre de ton foyer
-                </p>
-              </div>
-
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-2">
-                  Ton nom d'affichage
-                </label>
-                <input
-                  type="text"
-                  value={joinDisplayName}
-                  onChange={(e) => setJoinDisplayName(e.target.value)}
-                  placeholder="Ex: Richard"
-                  className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-                  required
-                />
-              </div>
-
-              <button
-                type="submit"
-                disabled={loading}
-                className="w-full bg-green-600 text-white py-3 px-4 rounded-lg hover:bg-green-700 transition disabled:opacity-50 disabled:cursor-not-allowed font-medium"
-              >
-                {loading ? 'Connexion...' : 'Rejoindre le foyer'}
-              </button>
-            </form>
-          )}
-        </div>
+    <div className="min-h-screen flex items-center justify-center bg-gray-50 px-4">
+      <div className="max-w-md w-full bg-white p-8 rounded-2xl shadow-lg border">
+        <h1 className="text-xl font-bold mb-3">Onboarding</h1>
+        <p className="text-gray-600 text-sm mb-4">
+          {error || "Tout est prêt."}
+        </p>
+        <button
+          className="w-full bg-blue-600 text-white py-3 rounded-lg hover:bg-blue-700"
+          onClick={() => navigate('/login', { replace: true })}
+        >
+          Retour connexion
+        </button>
       </div>
     </div>
   )
