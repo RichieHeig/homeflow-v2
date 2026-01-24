@@ -1,12 +1,29 @@
 import { create } from 'zustand'
-import { User } from '@supabase/supabase-js'
+import type { User } from '@supabase/supabase-js'
 
-interface AuthState {
+type Household = {
+  id: string
+  name?: string | null
+} | null
+
+type StoreState = {
   user: User | null
+  household: Household
   setUser: (user: User | null) => void
+  setHousehold: (household: Household) => void
+  clearAuth: () => void
 }
 
-export const useAuthStore = create<AuthState>((set) => ({
+export const useStore = create<StoreState>((set) => ({
   user: null,
+  household: null,
+
   setUser: (user) => set({ user }),
+  setHousehold: (household) => set({ household }),
+
+  clearAuth: () =>
+    set({
+      user: null,
+      household: null,
+    }),
 }))
