@@ -160,19 +160,23 @@ export default function Tasks() {
   }, [handleHardRefresh, setUser])
 
   // --- SAFETY VALVE (timeout de chargement) ---
-  useEffect(() => {
-    let safetyTimer: NodeJS.Timeout
-    if (loading) {
-      safetyTimer = setTimeout(() => {
-        if (loading) {
-          console.warn("🚨 Chargement trop long -> Arrêt du spinner")
-          setLoading(false)
-          setError("Le chargement a pris trop de temps. Vérifiez votre connexion.")
-        }
-      }, 10000)
-    }
-    return () => clearTimeout(safetyTimer)
-  }, [loading])
+ useEffect(() => {
+  let safetyTimer: ReturnType<typeof setTimeout> | null = null
+
+  if (loading) {
+    safetyTimer = setTimeout(() => {
+      if (loading) {
+        console.warn("🚨 Chargement trop long -> Arrêt du spinner")
+        setLoading(false)
+        setError("Le chargement a pris trop de temps. Vérifiez votre connexion.")
+      }
+    }, 10000)
+  }
+
+  return () => {
+    if (safetyTimer) clearTimeout(safetyTimer)
+  }
+}, [loading])
 
   // --- INITIAL LOAD ---
   useEffect(() => {
